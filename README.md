@@ -33,26 +33,59 @@ not the decade behind:
 ```
 go build ./cmd/perihelion
 ./perihelion wallet new
-./perihelion mine
+./perihelion mine                     # solo mining
 ./perihelion balance
 ./perihelion send --to per1... --amount 1.5
 ./perihelion info
 ```
 
+Run a networked node (P2P gossip + sync + local RPC):
+
+```
+./perihelion node --connect seed.example.org:16180 --mine
+```
+
 One binary, no configuration. Mining uses your CPU cores with Argon2id
 (64 MiB per attempt) — the same hardware budget for everyone.
 
+## Local RPC (the machine interface)
+
+The node serves an authenticated JSON API on `127.0.0.1:16181` — loopback
+only, protected by a token in `~/.perihelion/rpc-token`. This is how scripts
+and AI agents hold PER and pay with it:
+
+```
+curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" http://127.0.0.1:16181/status
+curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" http://127.0.0.1:16181/balance
+curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" -X POST \
+     -d '{"to":"per1...","amount":"1.5"}' http://127.0.0.1:16181/send
+```
+
+## Security posture
+
+- **No telemetry, no phone-home.** The node only ever talks to peers you
+  explicitly configure. `core` and `wallet` contain zero networking code.
+- **Peers are untrusted.** Every message is size-capped, every received block
+  and transaction is fully re-validated by consensus before it touches state.
+- **Keys never leave your machine.** The wallet is a local file (mode 0600);
+  the RPC binds to loopback and requires the local auth token.
+- **Memory-safe implementation** (Go), no `unsafe`, dependencies pinned by
+  hash in `go.sum`, `govulncheck` clean.
+
 ## Status
 
-Experimental. This is milestone 1: a fully validating single-node chain with
-post-quantum wallets, mining, transactions and supply accounting, covered by
-an end-to-end test suite. Not yet audited; do not store value you cannot
-afford to lose.
+Experimental. Milestones 1–2 are complete: a fully validating chain with
+post-quantum wallets, mining, fork choice with atomic reorgs (heaviest chain
+wins), P2P block/tx gossip with initial sync, and a local RPC. Covered by
+end-to-end, adversarial and two-node network tests. Not yet audited; do not
+store value you cannot afford to lose.
 
 Roadmap:
-- [ ] P2P networking: gossip, sync, fork choice (heaviest chain), reorgs
-- [ ] JSON-RPC API for explorers, exchanges and AI agents
+- [x] P2P networking: gossip, sync, fork choice (heaviest chain), reorgs
+- [x] Local JSON-RPC API (wallet + status)
 - [ ] Public testnet with seed nodes
+- [ ] Wallet file encryption (passphrase)
+- [ ] Block explorer
 - [ ] Independent security review
 - [ ] Mainnet genesis
 

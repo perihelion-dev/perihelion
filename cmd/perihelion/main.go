@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +27,11 @@ func defaultDataDir() string {
 }
 
 func openChain(datadir string) (*core.Chain, error) {
-	return core.Open(filepath.Join(datadir, "chain.db"))
+	c, err := core.Open(filepath.Join(datadir, "chain.db"))
+	if err != nil && strings.Contains(err.Error(), "timeout") {
+		return nil, fmt.Errorf("chain database is locked — a perihelion node is probably running on this datadir; stop it or use its RPC instead (%w)", err)
+	}
+	return c, err
 }
 
 func walletPath(datadir string) string {
@@ -54,6 +59,8 @@ func main() {
 		err = cmdBalance(os.Args[2:])
 	case "mine":
 		err = cmdMine(os.Args[2:])
+	case "node":
+		err = cmdNode(os.Args[2:])
 	case "send":
 		err = cmdSend(os.Args[2:])
 	case "info":
@@ -80,7 +87,9 @@ Usage:
   perihelion wallet new                        create a quantum-safe wallet
   perihelion wallet show                       show your address
   perihelion balance [ADDRESS]                 show balance
-  perihelion mine [--blocks N]                 mine (default: until Ctrl-C)
+  perihelion mine [--blocks N]                 mine solo (default: until Ctrl-C)
+  perihelion node [--connect HOST:PORT] [--mine]
+                                               run a networked node (P2P + local RPC)
   perihelion send --to ADDR --amount PER [--fee PER]
   perihelion info                              chain statistics
   perihelion block HEIGHT                      inspect a block

@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"fmt"
 	"math/big"
 	"runtime"
 	"sync"
@@ -10,28 +9,50 @@ import (
 	"time"
 )
 
+type MineOpts struct {
+	Logf    func(format string, a ...any)
+	OnBlock func(*Block) // called after each locally mined block is accepted
+}
+
 // Mine mines count blocks paying rewards to addr (count <= 0: run until the
-// context is cancelled). It parallelizes across CPU cores; each worker owns a
-// disjoint nonce range, so a laptop and a solar-powered mini PC alike can mine.
+// context is cancelled).
 func Mine(ctx context.Context, c *Chain, addr [32]byte, count int, logf func(format string, a ...any)) error {
+	return MineLoop(ctx, c, addr, count, MineOpts{Logf: logf})
+}
+
+// MineLoop is Mine with networking hooks: solving aborts the moment the chain
+// tip changes (a peer's block arrived), so no work is wasted on stale blocks.
+func MineLoop(ctx context.Context, c *Chain, addr [32]byte, count int, opts MineOpts) error {
+	logf := opts.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	mined := 0
 	for count <= 0 || mined < count {
 		if ctx.Err() != nil {
 			return nil
 		}
+		epoch := c.TipEpoch()
 		tmpl, err := c.NextBlockTemplate(addr)
 		if err != nil {
 			return err
 		}
-		solved, ok := solve(ctx, &tmpl.Header)
-		if !ok {
-			return nil // cancelled
+		solved := solve(ctx, &tmpl.Header, func() bool { return c.TipEpoch() != epoch })
+		if solved == nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue // tip moved while solving: rebuild template on the new tip
 		}
 		tmpl.Header = *solved
-		if err := c.AddBlock(tmpl); err != nil {
-			return fmt.Errorf("mined block rejected: %w", err)
+		if err := c.AcceptBlock(tmpl); err != nil {
+			logf("solved block no longer fits the chain (%v) — restarting on new tip", err)
+			continue
 		}
 		mined++
+		if opts.OnBlock != nil {
+			opts.OnBlock(tmpl)
+		}
 		h := tmpl.Header.Hash()
 		logf("block %d mined  hash=%x…  txs=%d  reward=%s PER",
 			tmpl.Header.Height, h[:8], len(tmpl.Txs), FormatAmount(tmpl.Txs[0].Outputs[0].Value))
@@ -52,10 +73,12 @@ func MinerThreads() int {
 	return n
 }
 
-func solve(ctx context.Context, hdr *BlockHeader) (*BlockHeader, bool) {
+// solve returns the solved header, or nil if the context was cancelled or
+// stale() reported that the chain tip moved.
+func solve(ctx context.Context, hdr *BlockHeader, stale func() bool) *BlockHeader {
 	workers := MinerThreads()
 	target := new(big.Int).SetBytes(hdr.Target[:])
-	var found atomic.Bool
+	var stop atomic.Bool
 	result := make(chan BlockHeader, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -64,13 +87,18 @@ func solve(ctx context.Context, hdr *BlockHeader) (*BlockHeader, bool) {
 			defer wg.Done()
 			local := *hdr
 			local.Nonce = uint64(w) << 56 // disjoint nonce space per worker
-			for !found.Load() {
+			for !stop.Load() {
 				select {
 				case <-ctx.Done():
+					stop.Store(true)
 					return
 				default:
 				}
 				if local.Nonce&0xff == 0 {
+					if stale != nil && stale() {
+						stop.Store(true)
+						return
+					}
 					// keep the timestamp fresh during long solves
 					if t := time.Now().Unix(); t > local.Time {
 						local.Time = t
@@ -78,7 +106,7 @@ func solve(ctx context.Context, hdr *BlockHeader) (*BlockHeader, bool) {
 				}
 				ph := PowHash(local.Serialize(), local.PrevHash)
 				if new(big.Int).SetBytes(ph[:]).Cmp(target) <= 0 {
-					if found.CompareAndSwap(false, true) {
+					if !stop.Swap(true) {
 						result <- local
 					}
 					return
@@ -90,7 +118,7 @@ func solve(ctx context.Context, hdr *BlockHeader) (*BlockHeader, bool) {
 	wg.Wait()
 	close(result)
 	if h, ok := <-result; ok {
-		return &h, true
+		return &h
 	}
-	return nil, false
+	return nil
 }

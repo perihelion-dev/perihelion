@@ -3,29 +3,73 @@ package core
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
 
+// ErrOrphan marks a block whose parent is unknown; the caller should fetch
+// the parent and retry.
+var ErrOrphan = errors.New("orphan block: parent unknown")
+
 var (
 	bBlocks  = []byte("blocks")
 	bHeight  = []byte("height")
+	bIndex   = []byte("index")
+	bUndo    = []byte("undo")
 	bUTXO    = []byte("utxo")
 	bMeta    = []byte("meta")
 	bMempool = []byte("mempool")
 
 	kTip       = []byte("tip")
 	kTipHeight = []byte("tipheight")
+	kTipWork   = []byte("tipwork")
 	kPool      = []byte("pool")
 	kEmitted   = []byte("emitted")
 	kBurned    = []byte("burned")
 )
+
+var two256 = new(big.Int).Lsh(big.NewInt(1), 256)
+
+// blockWork is the expected number of hash attempts a block's target
+// represents; fork choice follows the chain with the most cumulative work.
+func blockWork(target [32]byte) *big.Int {
+	t := new(big.Int).SetBytes(target[:])
+	t.Add(t, big.NewInt(1))
+	return new(big.Int).Div(two256, t)
+}
+
+// idxEntry is the per-block index: height and cumulative chain work. Blocks on
+// side branches are indexed too, so the node can evaluate competing chains.
+type idxEntry struct {
+	Height uint64
+	Work   *big.Int
+}
+
+func (e *idxEntry) serialize() []byte {
+	out := make([]byte, 40)
+	binary.BigEndian.PutUint64(out[:8], e.Height)
+	e.Work.FillBytes(out[8:40])
+	return out
+}
+
+func readIdx(dbtx *bolt.Tx, hash []byte) *idxEntry {
+	v := dbtx.Bucket(bIndex).Get(hash)
+	if len(v) != 40 {
+		return nil
+	}
+	return &idxEntry{
+		Height: binary.BigEndian.Uint64(v[:8]),
+		Work:   new(big.Int).SetBytes(v[8:40]),
+	}
+}
 
 type UTXO struct {
 	Value    uint64
@@ -68,11 +112,56 @@ func utxoKey(op OutPoint) []byte {
 	return k
 }
 
-// Chain is the on-disk blockchain state: blocks, UTXO set, supply accounting
-// and the local mempool. MVP scope: a strictly linear chain without reorgs;
-// fork choice arrives with the P2P layer.
+// undoRec captures everything needed to disconnect a block during a reorg:
+// the UTXOs it spent and the supply accounting before it connected.
+type undoRec struct {
+	spentKeys [][]byte
+	spentVals [][]byte
+	pool      uint64
+	emitted   uint64
+	burned    uint64
+}
+
+func (u *undoRec) serialize() []byte {
+	w := &buf{}
+	w.u32(uint32(len(u.spentKeys)))
+	for i := range u.spentKeys {
+		w.raw(u.spentKeys[i])
+		w.raw(u.spentVals[i])
+	}
+	w.u64(u.pool)
+	w.u64(u.emitted)
+	w.u64(u.burned)
+	return w.b
+}
+
+func parseUndo(b []byte) (*undoRec, error) {
+	r := &rdr{b: b}
+	u := &undoRec{}
+	n := int(r.u32())
+	if n > 1_000_000 {
+		return nil, errTruncated
+	}
+	for i := 0; i < n; i++ {
+		u.spentKeys = append(u.spentKeys, r.take(36))
+		u.spentVals = append(u.spentVals, r.take(49))
+	}
+	u.pool = r.u64()
+	u.emitted = r.u64()
+	u.burned = r.u64()
+	if err := r.done(); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// Chain is the on-disk blockchain state: all known blocks (including side
+// branches), the active chain's UTXO set, supply accounting and the local
+// mempool. Fork choice: most cumulative work wins; competing branches are
+// reorganized atomically.
 type Chain struct {
-	db *bolt.DB
+	db    *bolt.DB
+	epoch atomic.Uint64 // bumped whenever the active tip changes
 }
 
 func Open(path string) (*Chain, error) {
@@ -85,13 +174,16 @@ func Open(path string) (*Chain, error) {
 	}
 	c := &Chain{db: db}
 	err = db.Update(func(dbtx *bolt.Tx) error {
-		for _, name := range [][]byte{bBlocks, bHeight, bUTXO, bMeta, bMempool} {
+		for _, name := range [][]byte{bBlocks, bHeight, bIndex, bUndo, bUTXO, bMeta, bMempool} {
 			if _, err := dbtx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
 		}
 		meta := dbtx.Bucket(bMeta)
-		if meta.Get(kTip) != nil {
+		if tip := meta.Get(kTip); tip != nil {
+			if dbtx.Bucket(bIndex).Get(tip) == nil {
+				return rebuildIndex(dbtx)
+			}
 			return nil
 		}
 		g := GenesisBlock()
@@ -102,7 +194,17 @@ func Open(path string) (*Chain, error) {
 		if err := dbtx.Bucket(bHeight).Put(be64(0), gh[:]); err != nil {
 			return err
 		}
+		gw := blockWork(g.Header.Target)
+		e := &idxEntry{Height: 0, Work: gw}
+		if err := dbtx.Bucket(bIndex).Put(gh[:], e.serialize()); err != nil {
+			return err
+		}
 		if err := meta.Put(kTip, gh[:]); err != nil {
+			return err
+		}
+		var wb [32]byte
+		gw.FillBytes(wb[:])
+		if err := meta.Put(kTipWork, wb[:]); err != nil {
 			return err
 		}
 		for _, k := range [][]byte{kTipHeight, kPool, kEmitted, kBurned} {
@@ -119,7 +221,38 @@ func Open(path string) (*Chain, error) {
 	return c, nil
 }
 
+// rebuildIndex migrates databases created before fork choice existed: it
+// derives the block index from the active chain. Pre-migration blocks carry
+// no undo data, so reorgs below the migration point are refused.
+func rebuildIndex(dbtx *bolt.Tx) error {
+	meta := dbtx.Bucket(bMeta)
+	tipHeight := getU64(meta, kTipHeight)
+	work := new(big.Int)
+	for h := uint64(0); h <= tipHeight; h++ {
+		hash := dbtx.Bucket(bHeight).Get(be64(h))
+		if hash == nil {
+			return fmt.Errorf("corrupt chain: missing height %d", h)
+		}
+		hdr, err := readHeaderByHash(dbtx, hash)
+		if err != nil {
+			return err
+		}
+		work.Add(work, blockWork(hdr.Target))
+		e := &idxEntry{Height: h, Work: new(big.Int).Set(work)}
+		if err := dbtx.Bucket(bIndex).Put(hash, e.serialize()); err != nil {
+			return err
+		}
+	}
+	var wb [32]byte
+	work.FillBytes(wb[:])
+	return meta.Put(kTipWork, wb[:])
+}
+
 func (c *Chain) Close() error { return c.db.Close() }
+
+// TipEpoch increments every time the active tip changes; miners use it to
+// abandon stale work immediately.
+func (c *Chain) TipEpoch() uint64 { return c.epoch.Load() }
 
 // GenesisBlock is the hardcoded block 0. It carries no transactions and no
 // reward — the fair-launch anchor of the timeline.
@@ -148,30 +281,41 @@ func readBlock(dbtx *bolt.Tx, hash []byte) (*Block, error) {
 	return DeserializeBlock(raw)
 }
 
+func readHeaderByHash(dbtx *bolt.Tx, hash []byte) (*BlockHeader, error) {
+	raw := dbtx.Bucket(bBlocks).Get(hash)
+	if raw == nil {
+		return nil, fmt.Errorf("block %x not found", hash)
+	}
+	return DeserializeHeader(raw)
+}
+
 func readHeaderAt(dbtx *bolt.Tx, height uint64) (*BlockHeader, error) {
 	hash := dbtx.Bucket(bHeight).Get(be64(height))
 	if hash == nil {
 		return nil, fmt.Errorf("no block at height %d", height)
 	}
-	raw := dbtx.Bucket(bBlocks).Get(hash)
-	if raw == nil {
-		return nil, fmt.Errorf("missing block body at height %d", height)
-	}
-	return DeserializeHeader(raw)
+	return readHeaderByHash(dbtx, hash)
 }
 
-func recentHeaders(dbtx *bolt.Tx, tipHeight uint64, max int) ([]*BlockHeader, error) {
-	start := uint64(0)
-	if uint64(max) <= tipHeight {
-		start = tipHeight - uint64(max) + 1
-	}
-	var out []*BlockHeader
-	for h := start; h <= tipHeight; h++ {
-		hd, err := readHeaderAt(dbtx, h)
+// headersBack collects up to count consecutive headers ending at (and
+// including) the block `from`, oldest first. Works on any branch.
+func headersBack(dbtx *bolt.Tx, from [32]byte, count int) ([]*BlockHeader, error) {
+	var rev []*BlockHeader
+	h := from
+	for len(rev) < count {
+		hd, err := readHeaderByHash(dbtx, h[:])
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, hd)
+		rev = append(rev, hd)
+		if hd.Height == 0 {
+			break
+		}
+		h = hd.PrevHash
+	}
+	out := make([]*BlockHeader, len(rev))
+	for i := range rev {
+		out[len(rev)-1-i] = rev[i]
 	}
 	return out, nil
 }
@@ -233,6 +377,366 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 	}
 	return inSum - outSum, nil
 }
+
+// checkHeaderContextual runs every validation that does not need UTXO state:
+// linkage, timestamps, difficulty, structure, merkle commitment and PoW.
+func checkHeaderContextual(dbtx *bolt.Tx, b *Block, parent *BlockHeader) error {
+	hdr := &b.Header
+	if hdr.Version != 1 {
+		return fmt.Errorf("unknown block version %d", hdr.Version)
+	}
+	if hdr.Height != parent.Height+1 {
+		return fmt.Errorf("height %d does not follow parent height %d", hdr.Height, parent.Height)
+	}
+	if hdr.Time < parent.Time-TargetBlockTime {
+		return fmt.Errorf("timestamp too far in the past")
+	}
+	if hdr.Time > time.Now().Unix()+MaxFutureDrift {
+		return fmt.Errorf("timestamp too far in the future")
+	}
+	hdrs, err := headersBack(dbtx, hdr.PrevHash, DifficultyWindow+1)
+	if err != nil {
+		return err
+	}
+	if NextTarget(hdrs) != hdr.Target {
+		return fmt.Errorf("wrong difficulty target")
+	}
+	if len(b.Txs) == 0 || !b.Txs[0].IsCoinbase() {
+		return fmt.Errorf("first transaction must be coinbase")
+	}
+	cb := b.Txs[0]
+	if !bytes.Equal(cb.Extra, CoinbaseExtra(hdr.Height)) {
+		return fmt.Errorf("coinbase must commit to height")
+	}
+	if len(cb.Outputs) == 0 || len(cb.Outputs) > 100 {
+		return fmt.Errorf("bad coinbase outputs")
+	}
+	for i, t := range b.Txs[1:] {
+		if t.IsCoinbase() {
+			return fmt.Errorf("tx %d: unexpected coinbase", i+1)
+		}
+	}
+	seen := map[[32]byte]bool{}
+	for _, t := range b.Txs {
+		id := t.ID()
+		if seen[id] {
+			return fmt.Errorf("duplicate transaction in block")
+		}
+		seen[id] = true
+	}
+	if MerkleRoot(b.Txs) != hdr.MerkleRoot {
+		return fmt.Errorf("merkle root mismatch")
+	}
+	if !CheckPow(hdr) {
+		return fmt.Errorf("invalid proof of work")
+	}
+	return nil
+}
+
+// connectTip applies a block whose parent is the current active tip: full
+// transaction validation, UTXO updates, undo capture and supply accounting.
+func connectTip(dbtx *bolt.Tx, b *Block, bh [32]byte) error {
+	meta := dbtx.Bucket(bMeta)
+	height := b.Header.Height
+
+	spent := map[OutPoint]bool{}
+	var burnAdd, poolAdd uint64
+	for i, t := range b.Txs[1:] {
+		fee, err := checkTx(dbtx, t, height, spent)
+		if err != nil {
+			return fmt.Errorf("tx %d: %w", i+1, err)
+		}
+		for j := range t.Inputs {
+			spent[t.Inputs[j].Prev] = true
+		}
+		bn, pl := SplitFee(fee)
+		burnAdd += bn
+		poolAdd += pl
+	}
+	poolBal := getU64(meta, kPool)
+	payout := PoolPayout(poolBal + poolAdd)
+	subsidy := BlockSubsidy(height)
+	cb := b.Txs[0]
+	var cbOut uint64
+	for i := range cb.Outputs {
+		if cb.Outputs[i].Value > MaxSupply {
+			return fmt.Errorf("coinbase output out of range")
+		}
+		cbOut += cb.Outputs[i].Value
+	}
+	if cbOut != subsidy+payout {
+		return fmt.Errorf("coinbase pays %s, expected %s PER", FormatAmount(cbOut), FormatAmount(subsidy+payout))
+	}
+
+	utxos := dbtx.Bucket(bUTXO)
+	undo := &undoRec{
+		pool:    poolBal,
+		emitted: getU64(meta, kEmitted),
+		burned:  getU64(meta, kBurned),
+	}
+	for _, t := range b.Txs[1:] {
+		for i := range t.Inputs {
+			key := utxoKey(t.Inputs[i].Prev)
+			val := utxos.Get(key)
+			undo.spentKeys = append(undo.spentKeys, key)
+			undo.spentVals = append(undo.spentVals, append([]byte{}, val...))
+			if err := utxos.Delete(key); err != nil {
+				return err
+			}
+		}
+	}
+	for _, t := range b.Txs {
+		id := t.ID()
+		for i := range t.Outputs {
+			u := &UTXO{
+				Value:    t.Outputs[i].Value,
+				Addr:     t.Outputs[i].Addr,
+				Height:   height,
+				Coinbase: t.IsCoinbase(),
+			}
+			if err := utxos.Put(utxoKey(OutPoint{TxID: id, Index: uint32(i)}), u.serialize()); err != nil {
+				return err
+			}
+		}
+	}
+	if err := dbtx.Bucket(bUndo).Put(bh[:], undo.serialize()); err != nil {
+		return err
+	}
+	if err := dbtx.Bucket(bHeight).Put(be64(height), bh[:]); err != nil {
+		return err
+	}
+	e := readIdx(dbtx, bh[:])
+	if e == nil {
+		return fmt.Errorf("missing index entry for connecting block")
+	}
+	var wb [32]byte
+	e.Work.FillBytes(wb[:])
+	if err := meta.Put(kTip, bh[:]); err != nil {
+		return err
+	}
+	if err := meta.Put(kTipHeight, be64(height)); err != nil {
+		return err
+	}
+	if err := meta.Put(kTipWork, wb[:]); err != nil {
+		return err
+	}
+	newEmitted := undo.emitted + subsidy
+	if newEmitted > MaxSupply {
+		return fmt.Errorf("emission exceeds max supply — consensus bug")
+	}
+	if err := meta.Put(kEmitted, be64(newEmitted)); err != nil {
+		return err
+	}
+	if err := meta.Put(kBurned, be64(undo.burned+burnAdd)); err != nil {
+		return err
+	}
+	if err := meta.Put(kPool, be64(poolBal+poolAdd-payout)); err != nil {
+		return err
+	}
+
+	// Prune the mempool: drop anything whose inputs are no longer unspent
+	// (removes both included and now-conflicting transactions).
+	mp := dbtx.Bucket(bMempool)
+	var drop [][]byte
+	err := mp.ForEach(func(k, v []byte) error {
+		t, err := DeserializeTx(v)
+		if err != nil {
+			drop = append(drop, append([]byte{}, k...))
+			return nil
+		}
+		for i := range t.Inputs {
+			if utxos.Get(utxoKey(t.Inputs[i].Prev)) == nil {
+				drop = append(drop, append([]byte{}, k...))
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, k := range drop {
+		if err := mp.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// disconnectTip unwinds the active tip using its undo record and returns its
+// non-coinbase transactions to the mempool.
+func disconnectTip(dbtx *bolt.Tx) error {
+	meta := dbtx.Bucket(bMeta)
+	tipHeight := getU64(meta, kTipHeight)
+	if tipHeight == 0 {
+		return fmt.Errorf("cannot disconnect genesis")
+	}
+	tipHash := append([]byte{}, meta.Get(kTip)...)
+	b, err := readBlock(dbtx, tipHash)
+	if err != nil {
+		return err
+	}
+	undoRaw := dbtx.Bucket(bUndo).Get(tipHash)
+	if undoRaw == nil {
+		return fmt.Errorf("no undo data for block %x (pre-upgrade chain)", tipHash[:8])
+	}
+	u, err := parseUndo(undoRaw)
+	if err != nil {
+		return err
+	}
+	utxos := dbtx.Bucket(bUTXO)
+	for _, t := range b.Txs {
+		id := t.ID()
+		for i := range t.Outputs {
+			if err := utxos.Delete(utxoKey(OutPoint{TxID: id, Index: uint32(i)})); err != nil {
+				return err
+			}
+		}
+	}
+	for i := range u.spentKeys {
+		if err := utxos.Put(u.spentKeys[i], u.spentVals[i]); err != nil {
+			return err
+		}
+	}
+	if err := meta.Put(kPool, be64(u.pool)); err != nil {
+		return err
+	}
+	if err := meta.Put(kEmitted, be64(u.emitted)); err != nil {
+		return err
+	}
+	if err := meta.Put(kBurned, be64(u.burned)); err != nil {
+		return err
+	}
+	if err := dbtx.Bucket(bUndo).Delete(tipHash); err != nil {
+		return err
+	}
+	if err := dbtx.Bucket(bHeight).Delete(be64(tipHeight)); err != nil {
+		return err
+	}
+	parent := b.Header.PrevHash
+	pe := readIdx(dbtx, parent[:])
+	if pe == nil {
+		return fmt.Errorf("corrupt chain: parent of tip not indexed")
+	}
+	var wb [32]byte
+	pe.Work.FillBytes(wb[:])
+	if err := meta.Put(kTip, parent[:]); err != nil {
+		return err
+	}
+	if err := meta.Put(kTipHeight, be64(tipHeight-1)); err != nil {
+		return err
+	}
+	if err := meta.Put(kTipWork, wb[:]); err != nil {
+		return err
+	}
+	mp := dbtx.Bucket(bMempool)
+	for _, t := range b.Txs[1:] {
+		id := t.ID()
+		if err := mp.Put(id[:], t.Serialize()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reorgTo switches the active chain to the branch ending in b. Runs inside
+// the caller's transaction: any failure rolls back everything, leaving the
+// previous chain untouched.
+func reorgTo(dbtx *bolt.Tx, b *Block) error {
+	meta := dbtx.Bucket(bMeta)
+	heights := dbtx.Bucket(bHeight)
+
+	branch := []*Block{b}
+	cur := &b.Header
+	for {
+		ph := cur.PrevHash
+		pe := readIdx(dbtx, ph[:])
+		if pe == nil {
+			return fmt.Errorf("missing ancestor during reorg")
+		}
+		if bytes.Equal(heights.Get(be64(pe.Height)), ph[:]) {
+			break // parent is on the active chain: fork point found
+		}
+		pb, err := readBlock(dbtx, ph[:])
+		if err != nil {
+			return err
+		}
+		branch = append([]*Block{pb}, branch...)
+		cur = &pb.Header
+	}
+	forkHeight := branch[0].Header.Height - 1
+	for getU64(meta, kTipHeight) > forkHeight {
+		if err := disconnectTip(dbtx); err != nil {
+			return err
+		}
+	}
+	for _, blk := range branch {
+		if err := connectTip(dbtx, blk, blk.Header.Hash()); err != nil {
+			return fmt.Errorf("reorg aborted, chain unchanged: %w", err)
+		}
+	}
+	return nil
+}
+
+// AcceptBlock validates and stores a block. If it extends the active tip it
+// is connected directly; if it completes a branch with more cumulative work,
+// the chain reorganizes to it atomically; otherwise it is kept as a side
+// branch. Returns ErrOrphan when the parent is unknown.
+func (c *Chain) AcceptBlock(b *Block) error {
+	raw := b.Serialize()
+	if len(raw) > MaxBlockBytes {
+		return fmt.Errorf("block too large")
+	}
+	bh := b.Header.Hash()
+	var tipChanged bool
+	err := c.db.Update(func(dbtx *bolt.Tx) error {
+		if readIdx(dbtx, bh[:]) != nil {
+			return nil // duplicate
+		}
+		pe := readIdx(dbtx, b.Header.PrevHash[:])
+		if pe == nil {
+			return ErrOrphan
+		}
+		parentHdr, err := readHeaderByHash(dbtx, b.Header.PrevHash[:])
+		if err != nil {
+			return err
+		}
+		if err := checkHeaderContextual(dbtx, b, parentHdr); err != nil {
+			return err
+		}
+		work := new(big.Int).Add(pe.Work, blockWork(b.Header.Target))
+		if err := dbtx.Bucket(bBlocks).Put(bh[:], raw); err != nil {
+			return err
+		}
+		e := &idxEntry{Height: b.Header.Height, Work: work}
+		if err := dbtx.Bucket(bIndex).Put(bh[:], e.serialize()); err != nil {
+			return err
+		}
+		meta := dbtx.Bucket(bMeta)
+		if bytes.Equal(b.Header.PrevHash[:], meta.Get(kTip)) {
+			if err := connectTip(dbtx, b, bh); err != nil {
+				return err
+			}
+			tipChanged = true
+			return nil
+		}
+		tipWork := new(big.Int).SetBytes(meta.Get(kTipWork))
+		if work.Cmp(tipWork) > 0 {
+			if err := reorgTo(dbtx, b); err != nil {
+				return err
+			}
+			tipChanged = true
+		}
+		return nil
+	})
+	if err == nil && tipChanged {
+		c.epoch.Add(1)
+	}
+	return err
+}
+
+// AddBlock is a compatibility alias for AcceptBlock.
+func (c *Chain) AddBlock(b *Block) error { return c.AcceptBlock(b) }
 
 // SubmitTx validates a transaction against the confirmed UTXO set and pending
 // mempool spends, then queues it for inclusion in the next mined block.
@@ -334,7 +838,7 @@ func (c *Chain) NextBlockTemplate(miner [32]byte) (*Block, error) {
 		if now < parent.Time {
 			now = parent.Time
 		}
-		hdrs, err := recentHeaders(dbtx, tipHeight, DifficultyWindow+1)
+		hdrs, err := headersBack(dbtx, prev, DifficultyWindow+1)
 		if err != nil {
 			return err
 		}
@@ -354,177 +858,6 @@ func (c *Chain) NextBlockTemplate(miner [32]byte) (*Block, error) {
 	return blk, err
 }
 
-// AddBlock fully validates a solved block extending the tip and applies it to
-// the UTXO set and supply accounting.
-func (c *Chain) AddBlock(b *Block) error {
-	raw := b.Serialize()
-	if len(raw) > MaxBlockBytes {
-		return fmt.Errorf("block too large")
-	}
-	return c.db.Update(func(dbtx *bolt.Tx) error {
-		meta := dbtx.Bucket(bMeta)
-		tipHeight := getU64(meta, kTipHeight)
-		tip := meta.Get(kTip)
-		hdr := &b.Header
-		if hdr.Height != tipHeight+1 {
-			return fmt.Errorf("height %d does not extend tip %d", hdr.Height, tipHeight)
-		}
-		if !bytes.Equal(hdr.PrevHash[:], tip) {
-			return fmt.Errorf("prev hash does not match tip")
-		}
-		parent, err := readHeaderAt(dbtx, tipHeight)
-		if err != nil {
-			return err
-		}
-		if hdr.Time < parent.Time-TargetBlockTime {
-			return fmt.Errorf("timestamp too far in the past")
-		}
-		if hdr.Time > time.Now().Unix()+MaxFutureDrift {
-			return fmt.Errorf("timestamp too far in the future")
-		}
-		hdrs, err := recentHeaders(dbtx, tipHeight, DifficultyWindow+1)
-		if err != nil {
-			return err
-		}
-		if NextTarget(hdrs) != hdr.Target {
-			return fmt.Errorf("wrong difficulty target")
-		}
-		if len(b.Txs) == 0 || !b.Txs[0].IsCoinbase() {
-			return fmt.Errorf("first transaction must be coinbase")
-		}
-		cb := b.Txs[0]
-		if !bytes.Equal(cb.Extra, CoinbaseExtra(hdr.Height)) {
-			return fmt.Errorf("coinbase must commit to height")
-		}
-		if len(cb.Outputs) == 0 || len(cb.Outputs) > 100 {
-			return fmt.Errorf("bad coinbase outputs")
-		}
-		seen := map[[32]byte]bool{}
-		for _, t := range b.Txs {
-			id := t.ID()
-			if seen[id] {
-				return fmt.Errorf("duplicate transaction in block")
-			}
-			seen[id] = true
-		}
-		if MerkleRoot(b.Txs) != hdr.MerkleRoot {
-			return fmt.Errorf("merkle root mismatch")
-		}
-		if !CheckPow(hdr) {
-			return fmt.Errorf("invalid proof of work")
-		}
-
-		spent := map[OutPoint]bool{}
-		var burnAdd, poolAdd uint64
-		for i, t := range b.Txs[1:] {
-			if t.IsCoinbase() {
-				return fmt.Errorf("tx %d: unexpected coinbase", i+1)
-			}
-			fee, err := checkTx(dbtx, t, hdr.Height, spent)
-			if err != nil {
-				return fmt.Errorf("tx %d: %w", i+1, err)
-			}
-			for j := range t.Inputs {
-				spent[t.Inputs[j].Prev] = true
-			}
-			bn, pl := SplitFee(fee)
-			burnAdd += bn
-			poolAdd += pl
-		}
-		poolBal := getU64(meta, kPool)
-		payout := PoolPayout(poolBal + poolAdd)
-		subsidy := BlockSubsidy(hdr.Height)
-		var cbOut uint64
-		for i := range cb.Outputs {
-			if cb.Outputs[i].Value > MaxSupply {
-				return fmt.Errorf("coinbase output out of range")
-			}
-			cbOut += cb.Outputs[i].Value
-		}
-		if cbOut != subsidy+payout {
-			return fmt.Errorf("coinbase pays %s, expected %s PER", FormatAmount(cbOut), FormatAmount(subsidy+payout))
-		}
-
-		// All checks passed — apply.
-		utxos := dbtx.Bucket(bUTXO)
-		for _, t := range b.Txs[1:] {
-			for i := range t.Inputs {
-				if err := utxos.Delete(utxoKey(t.Inputs[i].Prev)); err != nil {
-					return err
-				}
-			}
-		}
-		for _, t := range b.Txs {
-			id := t.ID()
-			for i := range t.Outputs {
-				u := &UTXO{
-					Value:    t.Outputs[i].Value,
-					Addr:     t.Outputs[i].Addr,
-					Height:   hdr.Height,
-					Coinbase: t.IsCoinbase(),
-				}
-				if err := utxos.Put(utxoKey(OutPoint{TxID: id, Index: uint32(i)}), u.serialize()); err != nil {
-					return err
-				}
-			}
-		}
-		bh := hdr.Hash()
-		if err := dbtx.Bucket(bBlocks).Put(bh[:], raw); err != nil {
-			return err
-		}
-		if err := dbtx.Bucket(bHeight).Put(be64(hdr.Height), bh[:]); err != nil {
-			return err
-		}
-		if err := meta.Put(kTip, bh[:]); err != nil {
-			return err
-		}
-		if err := meta.Put(kTipHeight, be64(hdr.Height)); err != nil {
-			return err
-		}
-		newEmitted := getU64(meta, kEmitted) + subsidy
-		if newEmitted > MaxSupply {
-			return fmt.Errorf("emission exceeds max supply — consensus bug")
-		}
-		if err := meta.Put(kEmitted, be64(newEmitted)); err != nil {
-			return err
-		}
-		if err := meta.Put(kBurned, be64(getU64(meta, kBurned)+burnAdd)); err != nil {
-			return err
-		}
-		if err := meta.Put(kPool, be64(poolBal+poolAdd-payout)); err != nil {
-			return err
-		}
-
-		// Prune the mempool: drop anything whose inputs are no longer unspent
-		// (this removes both included and now-conflicting transactions).
-		mp := dbtx.Bucket(bMempool)
-		var drop [][]byte
-		err = mp.ForEach(func(k, v []byte) error {
-			t, err := DeserializeTx(v)
-			if err != nil {
-				drop = append(drop, append([]byte{}, k...))
-				return nil
-			}
-			for i := range t.Inputs {
-				if utxos.Get(utxoKey(t.Inputs[i].Prev)) == nil {
-					drop = append(drop, append([]byte{}, k...))
-					return nil
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		for _, k := range drop {
-			if err := mp.Delete(k); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
 func (c *Chain) BlockByHeight(h uint64) (*Block, error) {
 	var blk *Block
 	err := c.db.View(func(dbtx *bolt.Tx) error {
@@ -537,6 +870,82 @@ func (c *Chain) BlockByHeight(h uint64) (*Block, error) {
 		return err
 	})
 	return blk, err
+}
+
+// TipInfo returns the active tip's height and hash.
+func (c *Chain) TipInfo() (uint64, [32]byte, error) {
+	var height uint64
+	var hash [32]byte
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		meta := dbtx.Bucket(bMeta)
+		height = getU64(meta, kTipHeight)
+		copy(hash[:], meta.Get(kTip))
+		return nil
+	})
+	return height, hash, err
+}
+
+func (c *Chain) HasBlock(h [32]byte) bool {
+	var ok bool
+	c.db.View(func(dbtx *bolt.Tx) error {
+		ok = dbtx.Bucket(bBlocks).Get(h[:]) != nil
+		return nil
+	})
+	return ok
+}
+
+func (c *Chain) RawBlockByHash(h [32]byte) ([]byte, bool) {
+	var out []byte
+	c.db.View(func(dbtx *bolt.Tx) error {
+		if v := dbtx.Bucket(bBlocks).Get(h[:]); v != nil {
+			out = append([]byte{}, v...)
+		}
+		return nil
+	})
+	return out, out != nil
+}
+
+// RawBlocksFrom returns up to count consecutive active-chain blocks starting
+// at the given height (capped at 500 per request).
+func (c *Chain) RawBlocksFrom(from uint64, count int) ([][]byte, error) {
+	if count > 500 {
+		count = 500
+	}
+	if count < 1 {
+		count = 1
+	}
+	var out [][]byte
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		heights := dbtx.Bucket(bHeight)
+		blocks := dbtx.Bucket(bBlocks)
+		for h := from; h < from+uint64(count); h++ {
+			hash := heights.Get(be64(h))
+			if hash == nil {
+				break
+			}
+			raw := blocks.Get(hash)
+			if raw == nil {
+				break
+			}
+			out = append(out, append([]byte{}, raw...))
+		}
+		return nil
+	})
+	return out, err
+}
+
+// MempoolRaw returns up to 100 pending transactions for gossip.
+func (c *Chain) MempoolRaw() [][]byte {
+	var out [][]byte
+	c.db.View(func(dbtx *bolt.Tx) error {
+		return dbtx.Bucket(bMempool).ForEach(func(k, v []byte) error {
+			if len(out) < 100 {
+				out = append(out, append([]byte{}, v...))
+			}
+			return nil
+		})
+	})
+	return out
 }
 
 // Balance sums the UTXOs of an address, split into spendable and immature.
