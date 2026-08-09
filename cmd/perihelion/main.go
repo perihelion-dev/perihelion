@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -14,9 +15,27 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"perihelion/core"
 	"perihelion/wallet"
 )
+
+// promptPassword reads a password from the terminal without echoing it.
+func promptPassword(prompt string) (string, error) {
+	fmt.Print(prompt)
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		// Non-interactive (piped) input: read a line as fallback.
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
 
 func defaultDataDir() string {
 	home, err := os.UserHomeDir()
@@ -38,10 +57,31 @@ func walletPath(datadir string) string {
 	return filepath.Join(datadir, "wallet.json")
 }
 
-func loadWallet(datadir string) (*wallet.Wallet, error) {
+// loadWalletAddr loads a wallet for read-only use (address/balance): it never
+// needs the password because the public key is stored in clear.
+func loadWalletAddr(datadir string) (*wallet.Wallet, error) {
 	w, err := wallet.Load(walletPath(datadir))
 	if err != nil {
 		return nil, fmt.Errorf("no wallet found (%v) — create one with: perihelion wallet new", err)
+	}
+	return w, nil
+}
+
+// loadWallet loads and, if the wallet is encrypted, unlocks it by prompting
+// for the password. Used by commands that must sign (send).
+func loadWallet(datadir string) (*wallet.Wallet, error) {
+	w, err := loadWalletAddr(datadir)
+	if err != nil {
+		return nil, err
+	}
+	if w.Locked() {
+		pw, err := promptPassword("Wallet password: ")
+		if err != nil {
+			return nil, err
+		}
+		if err := w.Unlock(pw); err != nil {
+			return nil, err
+		}
 	}
 	return w, nil
 }
@@ -84,8 +124,10 @@ func usage() {
 	fmt.Print(`Perihelion (PER) — post-quantum, CPU-mineable, deflationary.
 
 Usage:
-  perihelion wallet new                        create a quantum-safe wallet
+  perihelion wallet new                        create a quantum-safe wallet (password + 24-word phrase)
+  perihelion wallet restore                     restore a wallet from its 24-word phrase
   perihelion wallet show                       show your address
+  perihelion wallet phrase                      reveal your recovery phrase (asks for password)
   perihelion balance [ADDRESS]                 show balance
   perihelion mine [--blocks N]                 mine solo (default: until Ctrl-C)
   perihelion node [--connect HOST:PORT] [--mine]
@@ -114,30 +156,102 @@ func cmdWallet(args []string) error {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("wallet already exists at %s — refusing to overwrite it", path)
 		}
-		w, err := wallet.New()
+		pw, err := newPassword()
+		if err != nil {
+			return err
+		}
+		w, mnemonic, err := wallet.Create(pw)
 		if err != nil {
 			return err
 		}
 		if err := w.Save(path); err != nil {
 			return err
 		}
-		fmt.Println("New quantum-safe wallet created (ML-DSA-65).")
+		fmt.Println("\nNew quantum-safe wallet created (ML-DSA-65).")
 		fmt.Println("Address:", wallet.EncodeAddress(w.Address()))
-		fmt.Println()
-		fmt.Println("IMPORTANT: back up this file — it IS your money:")
-		fmt.Println(" ", path)
+		printMnemonic(mnemonic)
+		return nil
+	case "restore":
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("wallet already exists at %s — move it aside before restoring", path)
+		}
+		fmt.Println("Enter your 24-word recovery phrase (all on one line):")
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		pw, err := newPassword()
+		if err != nil {
+			return err
+		}
+		w, err := wallet.Restore(line, pw)
+		if err != nil {
+			return err
+		}
+		if err := w.Save(path); err != nil {
+			return err
+		}
+		fmt.Println("\nWallet restored.")
+		fmt.Println("Address:", wallet.EncodeAddress(w.Address()))
 		return nil
 	case "show":
-		w, err := loadWallet(*datadir)
+		w, err := loadWalletAddr(*datadir)
 		if err != nil {
 			return err
 		}
 		fmt.Println("Address:", wallet.EncodeAddress(w.Address()))
 		fmt.Println("Scheme: ", core.SigScheme.Name())
 		return nil
+	case "phrase":
+		w, err := loadWalletAddr(*datadir)
+		if err != nil {
+			return err
+		}
+		pw, err := promptPassword("Wallet password: ")
+		if err != nil {
+			return err
+		}
+		m, err := w.RevealMnemonic(pw)
+		if err != nil {
+			return err
+		}
+		printMnemonic(m)
+		return nil
 	default:
-		return fmt.Errorf("usage: perihelion wallet new|show")
+		return fmt.Errorf("usage: perihelion wallet new|restore|show|phrase")
 	}
+}
+
+// newPassword prompts for a password twice and checks they match.
+func newPassword() (string, error) {
+	pw, err := promptPassword("Choose a wallet password: ")
+	if err != nil {
+		return "", err
+	}
+	if len(pw) < 8 {
+		return "", fmt.Errorf("password must be at least 8 characters")
+	}
+	again, err := promptPassword("Repeat password: ")
+	if err != nil {
+		return "", err
+	}
+	if pw != again {
+		return "", fmt.Errorf("passwords do not match")
+	}
+	return pw, nil
+}
+
+func printMnemonic(m string) {
+	fmt.Println()
+	fmt.Println("┌─ RECOVERY PHRASE ─ write these 24 words down and keep them offline ─┐")
+	words := strings.Fields(m)
+	for i := 0; i < len(words); i += 4 {
+		fmt.Print("  ")
+		for j := i; j < i+4 && j < len(words); j++ {
+			fmt.Printf("%2d. %-10s", j+1, words[j])
+		}
+		fmt.Println()
+	}
+	fmt.Println("└────────────────────────────────────────────────────────────────────┘")
+	fmt.Println("Anyone with these words controls your coins. We can never recover them for you.")
 }
 
 func cmdBalance(args []string) error {
@@ -154,7 +268,7 @@ func cmdBalance(args []string) error {
 		}
 		addr = a
 	} else {
-		w, err := loadWallet(*datadir)
+		w, err := loadWalletAddr(*datadir)
 		if err != nil {
 			return err
 		}
@@ -181,10 +295,12 @@ func cmdMine(args []string) error {
 	fs := flag.NewFlagSet("mine", flag.ExitOnError)
 	datadir := fs.String("datadir", defaultDataDir(), "data directory")
 	blocks := fs.Int("blocks", 0, "number of blocks to mine (0 = until Ctrl-C)")
+	threads := fs.Int("threads", 0, "mining threads (0 = automatic)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	w, err := loadWallet(*datadir)
+	core.SetMinerThreads(*threads)
+	w, err := loadWalletAddr(*datadir)
 	if err != nil {
 		return err
 	}

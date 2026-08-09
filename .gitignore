@@ -1,3 +1,9 @@
 /perihelion
 *.db
 .DS_Store
+perihelion-linux
+perihelion-app
+Perihelion.app/
+icon.png
+icon.icns
+icon.iconset/

@@ -24,13 +24,16 @@ import (
 func cmdNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	datadir := fs.String("datadir", defaultDataDir(), "data directory")
-	listen := fs.String("listen", fmt.Sprintf(":%d", p2p.DefaultPort), `P2P listen address ("off" to disable)`)
+	listen := fs.String("listen", fmt.Sprintf(":%d", p2p.DefaultPort), `P2P listen address ("off" to disable — outbound connections only)`)
 	connect := fs.String("connect", "", "comma-separated peer addresses (host:port)")
 	mine := fs.Bool("mine", false, "mine while running the node")
-	rpcAddr := fs.String("rpc", "127.0.0.1:16181", `local RPC address ("off" to disable)`)
+	mineto := fs.String("mineto", "", "mine to this address instead of the local wallet (per1...); lets a server mine without holding any keys")
+	threads := fs.Int("threads", 0, "mining threads (0 = automatic)")
+	rpcAddr := fs.String("rpc", "127.0.0.1:16181", `local RPC + dashboard address ("off" to disable)`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	core.SetMinerThreads(*threads)
 
 	c, err := openChain(*datadir)
 	if err != nil {
@@ -41,8 +44,22 @@ func cmdNode(args []string) error {
 	var w *wallet.Wallet
 	if wl, err := wallet.Load(walletPath(*datadir)); err == nil {
 		w = wl
-	} else if *mine {
-		return fmt.Errorf("mining needs a wallet — create one with: perihelion wallet new")
+	}
+
+	var mineAddr [32]byte
+	if *mine {
+		switch {
+		case *mineto != "":
+			a, err := wallet.DecodeAddress(*mineto)
+			if err != nil {
+				return fmt.Errorf("--mineto: %w", err)
+			}
+			mineAddr = a
+		case w != nil:
+			mineAddr = w.Address()
+		default:
+			return fmt.Errorf("mining needs a wallet (perihelion wallet new) or an explicit --mineto address")
+		}
 	}
 
 	logf := func(format string, a ...any) {
@@ -79,20 +96,20 @@ func cmdNode(args []string) error {
 		if err != nil {
 			return err
 		}
-		rpcServer = startRPC(*rpcAddr, token, c, w, node, logf)
-		logf("rpc: http://%s (token in %s)", *rpcAddr, filepath.Join(*datadir, "rpc-token"))
+		rpcServer = startRPC(*rpcAddr, token, c, w, node, *mine, logf)
+		logf("dashboard: http://%s", *rpcAddr)
 	}
 
 	if *mine {
 		go func() {
-			if err := core.MineLoop(ctx, c, w.Address(), 0, core.MineOpts{
+			if err := core.MineLoop(ctx, c, mineAddr, 0, core.MineOpts{
 				Logf:    logf,
 				OnBlock: node.BroadcastBlock,
 			}); err != nil {
 				logf("miner stopped: %v", err)
 			}
 		}()
-		logf("miner: %d threads, rewards to %s", core.MinerThreads(), wallet.EncodeAddress(w.Address()))
+		logf("miner: %d threads, rewards to %s", core.MinerThreads(), wallet.EncodeAddress(mineAddr))
 	}
 
 	if st, err := c.Stats(); err == nil {
@@ -129,10 +146,12 @@ func rpcToken(datadir string) (string, error) {
 	return tok, nil
 }
 
-// startRPC serves a small authenticated JSON API on localhost: /status,
-// /balance and /send. This is the machine interface — an AI agent or script
-// talks to the node exactly the way the CLI does, no browser, no cloud.
-func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Node, logf func(string, ...any)) *http.Server {
+// startRPC serves the dashboard and a small authenticated JSON API on
+// localhost: /status, /balance, /recent and /send. This is the machine
+// interface — an AI agent or script talks to the node exactly the way the
+// dashboard does. The Host check blocks DNS-rebinding tricks; the token
+// blocks blind cross-site requests.
+func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Node, mining bool, logf func(string, ...any)) *http.Server {
 	mux := http.NewServeMux()
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(rw http.ResponseWriter, r *http.Request) {
@@ -148,6 +167,14 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 		rw.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(rw).Encode(v)
 	}
+	mux.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(rw, r)
+			return
+		}
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(rw, strings.ReplaceAll(dashboardHTML, "__TOKEN__", token))
+	})
 	mux.HandleFunc("/status", auth(func(rw http.ResponseWriter, r *http.Request) {
 		st, err := c.Stats()
 		if err != nil {
@@ -164,6 +191,8 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 			"difficulty": st.Difficulty.String(),
 			"mempool":    st.Mempool,
 			"peers":      node.PeerCount(),
+			"mining":     mining,
+			"threads":    core.MinerThreads(),
 		})
 	}))
 	mux.HandleFunc("/balance", auth(func(rw http.ResponseWriter, r *http.Request) {
@@ -181,6 +210,36 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 			"spendable": core.FormatAmount(sp),
 			"immature":  core.FormatAmount(im),
 		})
+	}))
+	mux.HandleFunc("/recent", auth(func(rw http.ResponseWriter, r *http.Request) {
+		st, err := c.Stats()
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		blocks := []map[string]any{}
+		for h := st.Height; h > 0 && len(blocks) < 15; h-- {
+			b, err := c.BlockByHeight(h)
+			if err != nil {
+				break
+			}
+			cb := b.Txs[0]
+			var reward uint64
+			for i := range cb.Outputs {
+				reward += cb.Outputs[i].Value
+			}
+			mine := w != nil && len(cb.Outputs) > 0 && cb.Outputs[0].Addr == w.Address()
+			bh := b.Header.Hash()
+			blocks = append(blocks, map[string]any{
+				"height": h,
+				"hash":   hex.EncodeToString(bh[:8]),
+				"time":   b.Header.Time,
+				"txs":    len(b.Txs),
+				"reward": core.FormatAmount(reward),
+				"mine":   mine,
+			})
+		}
+		writeJSON(rw, map[string]any{"blocks": blocks})
 	}))
 	mux.HandleFunc("/send", auth(func(rw http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -225,10 +284,26 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 		}
 		node.BroadcastTx(tx)
 		id := tx.ID()
-		logf("rpc: sent %s PER to %s (tx %x…)", core.FormatAmount(amount), req.To[:12], id[:8])
+		logf("rpc: sent %s PER to %s… (tx %x…)", core.FormatAmount(amount), req.To[:12], id[:8])
 		writeJSON(rw, map[string]any{"txid": hex.EncodeToString(id[:])})
 	}))
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	// Host allowlist (only when bound to loopback): defeats DNS-rebinding.
+	var handler http.Handler = mux
+	if strings.HasPrefix(addr, "127.0.0.1:") || strings.HasPrefix(addr, "localhost:") {
+		handler = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			host := r.Host
+			if i := strings.LastIndex(host, ":"); i >= 0 {
+				host = host[:i]
+			}
+			if host != "127.0.0.1" && host != "localhost" {
+				http.Error(rw, "forbidden host", http.StatusForbidden)
+				return
+			}
+			mux.ServeHTTP(rw, r)
+		})
+	}
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logf("rpc error: %v", err)

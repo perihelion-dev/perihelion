@@ -60,9 +60,26 @@ func MineLoop(ctx context.Context, c *Chain, addr [32]byte, count int, opts Mine
 	return nil
 }
 
+var minerThreadsOverride int
+
+// SetMinerThreads overrides mining parallelism (0 restores automatic).
+// Useful on shared machines: a seed VPS can mine gently with one thread.
+func SetMinerThreads(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > 8 {
+		n = 8
+	}
+	minerThreadsOverride = n
+}
+
 // MinerThreads returns the mining parallelism: one worker per core, capped so
 // the memory-hard PoW stays well under a gigabyte in total.
 func MinerThreads() int {
+	if minerThreadsOverride > 0 {
+		return minerThreadsOverride
+	}
 	n := runtime.NumCPU()
 	if n > 8 {
 		n = 8
