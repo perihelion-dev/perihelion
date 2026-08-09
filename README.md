@@ -20,6 +20,9 @@ The consensus implementation is roughly 3,000 lines of Go. That is deliberate:
 a monetary system should be small enough that a competent reader can audit it
 in an afternoon.
 
+The design, its rationale and its limitations are set out in full in the
+[whitepaper](WHITEPAPER.md).
+
 ## Design
 
 | | Bitcoin | Perihelion |
