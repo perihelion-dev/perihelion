@@ -29,11 +29,27 @@ func cmdNode(args []string) error {
 	mine := fs.Bool("mine", false, "mine while running the node")
 	mineto := fs.String("mineto", "", "mine to this address instead of the local wallet (per1...); lets a server mine without holding any keys")
 	threads := fs.Int("threads", 0, "mining threads (0 = automatic)")
+	signalNames := fs.String("signal", "", "comma-separated deployment names this node's miner supports (see `perihelion governance`)")
 	rpcAddr := fs.String("rpc", "127.0.0.1:16181", `local RPC + dashboard address ("off" to disable)`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	core.SetMinerThreads(*threads)
+	if *signalNames != "" {
+		var bits uint32
+		for _, name := range strings.Split(*signalNames, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			d, ok := core.DeploymentByName(name)
+			if !ok {
+				return fmt.Errorf("unknown deployment %q — run `perihelion governance` to list proposals", name)
+			}
+			bits |= 1 << d.Bit
+		}
+		core.SetMinerSignalBits(bits)
+	}
 
 	c, err := openChain(*datadir)
 	if err != nil {

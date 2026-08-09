@@ -11,9 +11,10 @@ Mainnet genesis: 2026-08-09 00:00:00 UTC · No premine · MIT licensed
 ---
 
 Perihelion is a from-scratch cryptocurrency built for the next thirty years
-rather than the last fifteen. Its signatures are quantum-resistant from block
-one, its proof-of-work is designed so ordinary computers stay competitive, and
-its monetary policy is deflationary while still paying miners indefinitely.
+rather than the last fifteen. Its signatures use NIST-standardised
+post-quantum cryptography from block one, its proof-of-work is designed so
+ordinary computers stay competitive, and its monetary policy is deflationary
+while still paying miners indefinitely.
 
 The consensus implementation is roughly 3,000 lines of Go. That is deliberate:
 a monetary system should be small enough that a competent reader can audit it
@@ -34,10 +35,19 @@ in an afternoon.
 ### Post-quantum cryptography
 
 Every signature in Perihelion is ML-DSA-65 (Dilithium), standardised by NIST
-in FIPS 204 and believed secure against both classical and quantum
-adversaries. There is no elliptic-curve fallback anywhere in the protocol, so
+in FIPS 204 and selected specifically for resistance to attack by quantum
+computers. There is no elliptic-curve fallback anywhere in the protocol, so
 there is no migration to perform later and no legacy path for an attacker to
 target. Addresses are SHA3-256 commitments to the public key.
+
+To be precise about what this claims: no cryptography is provably unbreakable.
+"Post-quantum" means that after years of open international cryptanalysis, no
+efficient attack — classical or quantum — is known against the underlying
+lattice problem, which is why NIST standardised it as the replacement for
+ECDSA and RSA. Bitcoin and Ethereum signatures, by contrast, are broken by a
+sufficiently large quantum computer running Shor's algorithm. Should ML-DSA
+ever be weakened, a successor scheme can be deployed through the network
+governance process like any other consensus change.
 
 The trade-off is size: an ML-DSA-65 signature is approximately 3.3 KB versus
 71 bytes for ECDSA. Perihelion accepts larger transactions in exchange for
@@ -215,11 +225,23 @@ rules that applied equally to everyone.
 - [ ] Reproducible builds and signed releases
 - [ ] Independent security audit
 
+## Governance
+
+Perihelion has no owner. Consensus rules change only through on-chain miner
+signalling — 90% of blocks across a ~one-week window, with activation one
+window later — and monetary policy is permanently outside that process. The
+repository maintainers hold no protocol authority: nodes adopt changes
+voluntarily or not at all. The full process, including what can never change,
+is specified in [GOVERNANCE.md](GOVERNANCE.md) and implemented in
+`core/deployment.go`.
+
 ## Contributing
 
 Run a node. Mine. Read `core/` and report anything that looks wrong — issues
-and pull requests are welcome. There is no company behind Perihelion, no
-treasury, and nothing to buy. The code is the entire proposition.
+and pull requests are welcome. Consensus-affecting proposals follow the PIP
+process in [GOVERNANCE.md](GOVERNANCE.md). There is no company behind
+Perihelion, no treasury, and nothing to buy. The code is the entire
+proposition.
 
 ## License
 

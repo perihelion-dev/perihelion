@@ -384,8 +384,8 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 // linkage, timestamps, difficulty, structure, merkle commitment and PoW.
 func checkHeaderContextual(dbtx *bolt.Tx, b *Block, parent *BlockHeader) error {
 	hdr := &b.Header
-	if hdr.Version != 1 {
-		return fmt.Errorf("unknown block version %d", hdr.Version)
+	if !ValidBlockVersion(hdr.Version) {
+		return fmt.Errorf("malformed block version %#x", hdr.Version)
 	}
 	if hdr.Height != parent.Height+1 {
 		return fmt.Errorf("height %d does not follow parent height %d", hdr.Height, parent.Height)
@@ -846,7 +846,7 @@ func (c *Chain) NextBlockTemplate(miner [32]byte) (*Block, error) {
 		}
 		blk = &Block{
 			Header: BlockHeader{
-				Version:    1,
+				Version:    VersionSignalBase | (minerSignalBits & VersionBitsMask),
 				Height:     height,
 				PrevHash:   prev,
 				MerkleRoot: MerkleRoot(txs),
@@ -1017,6 +1017,90 @@ func (c *Chain) ListSpendable(addr [32]byte, want uint64) ([]Spendable, error) {
 		}
 	}
 	return nil, fmt.Errorf("insufficient funds: have %s, need %s PER", FormatAmount(sum), FormatAmount(want))
+}
+
+// DeploymentStatus computes the network's verdict on a proposed rule change
+// from the active chain. The result depends only on the blocks themselves, so
+// every node reaches the same answer without consulting anyone.
+func (c *Chain) DeploymentStatus(d Deployment) (*DeploymentStatus, error) {
+	st := &DeploymentStatus{Deployment: d, State: StateDefined}
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		tip := getU64(dbtx.Bucket(bMeta), kTipHeight)
+		if tip < d.StartHeight {
+			return nil
+		}
+		heights := dbtx.Bucket(bHeight)
+		blocks := dbtx.Bucket(bBlocks)
+		signalsIn := func(from, to uint64) (signals, counted uint64, err error) {
+			for h := from; h < to; h++ {
+				hash := heights.Get(be64(h))
+				if hash == nil {
+					return signals, counted, nil
+				}
+				raw := blocks.Get(hash)
+				if raw == nil {
+					return signals, counted, nil
+				}
+				hdr, err := DeserializeHeader(raw)
+				if err != nil {
+					return 0, 0, err
+				}
+				counted++
+				if SignalsBit(hdr.Version, d.Bit) {
+					signals++
+				}
+			}
+			return signals, counted, nil
+		}
+
+		st.State = StateStarted
+		for w := d.StartHeight; ; w += SignalWindow {
+			end := w + SignalWindow
+			if end > tip+1 {
+				// Window still filling: report progress and stop.
+				sig, cnt, err := signalsIn(w, tip+1)
+				if err != nil {
+					return err
+				}
+				st.WindowStart, st.WindowSignals, st.WindowBlocks = w, sig, cnt
+				return nil
+			}
+			if w >= d.TimeoutHeight {
+				st.State = StateFailed
+				return nil
+			}
+			sig, _, err := signalsIn(w, end)
+			if err != nil {
+				return err
+			}
+			if sig >= SignalThreshold {
+				st.State = StateLockedIn
+				st.ActivationHeight = end + SignalWindow
+				if tip >= st.ActivationHeight {
+					st.State = StateActive
+				}
+				return nil
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// IsDeploymentActive reports whether a named rule change is in force at the
+// current tip. Consensus code gates new rules on this and nothing else.
+func (c *Chain) IsDeploymentActive(name string) (bool, error) {
+	d, ok := DeploymentByName(name)
+	if !ok {
+		return false, nil
+	}
+	st, err := c.DeploymentStatus(d)
+	if err != nil {
+		return false, err
+	}
+	return st.State == StateActive, nil
 }
 
 type Stats struct {

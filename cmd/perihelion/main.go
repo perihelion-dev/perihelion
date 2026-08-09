@@ -107,6 +107,8 @@ func main() {
 		err = cmdInfo(os.Args[2:])
 	case "block":
 		err = cmdBlock(os.Args[2:])
+	case "governance":
+		err = cmdGovernance(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -135,9 +137,47 @@ Usage:
   perihelion send --to ADDR --amount PER [--fee PER]
   perihelion info                              chain statistics
   perihelion block HEIGHT                      inspect a block
+  perihelion governance                        list proposed rule changes and their network status
 
 All commands accept --datadir DIR (default ~/.perihelion).
 `)
+}
+
+func cmdGovernance(args []string) error {
+	fs := flag.NewFlagSet("governance", flag.ExitOnError)
+	datadir := fs.String("datadir", defaultDataDir(), "data directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(core.Deployments) == 0 {
+		fmt.Println("No rule changes are currently proposed.")
+		fmt.Println()
+		fmt.Println("Perihelion changes consensus rules only through miner signalling:")
+		fmt.Printf("a proposal activates when %d of %d blocks in a window signal support\n", core.SignalThreshold, core.SignalWindow)
+		fmt.Println("(90% over ~7 days), and takes effect one window later. Monetary policy")
+		fmt.Println("(emission, supply bound, fee burn) is permanently outside this process.")
+		return nil
+	}
+	c, err := openChain(*datadir)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	for _, d := range core.Deployments {
+		st, err := c.DeploymentStatus(d)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%-24s bit %-2d  state %-10s", d.Name, d.Bit, st.State)
+		if st.State == core.StateStarted && st.WindowBlocks > 0 {
+			fmt.Printf("  window %d: %d/%d signalling", st.WindowStart, st.WindowSignals, st.WindowBlocks)
+		}
+		if st.ActivationHeight > 0 {
+			fmt.Printf("  activation height %d", st.ActivationHeight)
+		}
+		fmt.Println()
+	}
+	return nil
 }
 
 func cmdWallet(args []string) error {
