@@ -80,6 +80,15 @@ func readFrame(conn net.Conn) (byte, []byte, error) {
 	return hdr[4], p, nil
 }
 
+// The handshake is APPEND-ONLY. Fields may be added at the end and readers
+// must tolerate a payload that ends before them; no existing field may be
+// moved, resized or reinterpreted. Peer software is not upgraded in lockstep,
+// so a reader that insists on an exact length rejects every newer peer and
+// silently partitions the network — which happened once, on 9 August 2026,
+// when the listen-address field was introduced. Bump ProtocolVersion instead
+// if a genuinely incompatible change is ever required, so that peers refuse
+// each other explicitly rather than failing to parse.
+//
 // encodeHello writes the handshake. Nodes that accept inbound connections
 // append the address they listen on so that others can reach them directly;
 // nodes that do not listen append nothing and stay unreachable by design.
