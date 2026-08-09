@@ -126,6 +126,7 @@ func cmdNode(args []string) error {
 			if err := core.MineLoop(ctx, c, mineAddr, 0, core.MineOpts{
 				Logf:    logf,
 				OnBlock: node.BroadcastBlock,
+				Ready:   node.Synced,
 			}); err != nil {
 				logf("miner stopped: %v", err)
 			}

@@ -17,6 +17,12 @@ const (
 	maxSeenTx   = 16384
 	syncBatch   = 200
 	reqThrottle = 2 * time.Second
+
+	// isolationGrace is how long a node waits for peers before concluding it
+	// is alone and may mine anyway. Without it a node that has not finished
+	// dialling would start building its own branch from genesis; with it, a
+	// genuinely isolated network can still bootstrap.
+	isolationGrace = 90 * time.Second
 )
 
 // Node gossips blocks and transactions with configured peers and keeps the
@@ -39,6 +45,34 @@ type Node struct {
 
 	lnMu     sync.Mutex
 	listener net.Listener
+
+	startedAt time.Time
+}
+
+// Synced reports whether this node has caught up with the best chain any peer
+// claims. Mining before this is true wastes work on a branch that will lose
+// the fork-choice comparison the moment the real chain arrives, and floods
+// peers with blocks they will only file away as a dead side branch.
+func (n *Node) Synced() bool {
+	var best uint64
+	n.mu.Lock()
+	peerCount := len(n.peers)
+	for _, p := range n.peers {
+		p.mu.Lock()
+		if p.height > best {
+			best = p.height
+		}
+		p.mu.Unlock()
+	}
+	n.mu.Unlock()
+	if peerCount == 0 {
+		return time.Since(n.startedAt) > isolationGrace
+	}
+	height, _, err := n.chain.TipInfo()
+	if err != nil {
+		return false
+	}
+	return height >= best
 }
 
 type peer struct {
@@ -64,14 +98,15 @@ func New(chain *core.Chain, logf func(string, ...any)) *Node {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Node{
-		chain:   chain,
-		logf:    logf,
-		ctx:     ctx,
-		cancel:  cancel,
-		peers:   map[string]*peer{},
-		orphans: map[[32]byte][]byte{},
-		waiting: map[[32]byte][][32]byte{},
-		seenTx:  map[[32]byte]struct{}{},
+		chain:     chain,
+		logf:      logf,
+		ctx:       ctx,
+		cancel:    cancel,
+		peers:     map[string]*peer{},
+		orphans:   map[[32]byte][]byte{},
+		waiting:   map[[32]byte][][32]byte{},
+		seenTx:    map[[32]byte]struct{}{},
+		startedAt: time.Now(),
 	}
 }
 

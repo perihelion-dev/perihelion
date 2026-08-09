@@ -362,7 +362,10 @@ func (s *appState) setIntensity(level string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.mineCancel = cancel
 	s.cancel = cancel
-	go core.MineLoop(ctx, s.chain, s.wallet.Address(), 0, core.MineOpts{OnBlock: s.node.BroadcastBlock})
+	go core.MineLoop(ctx, s.chain, s.wallet.Address(), 0, core.MineOpts{
+		OnBlock: s.node.BroadcastBlock,
+		Ready:   s.node.Synced,
+	})
 }
 
 func (s *appState) showDashboard() {

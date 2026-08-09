@@ -12,6 +12,12 @@ import (
 type MineOpts struct {
 	Logf    func(format string, a ...any)
 	OnBlock func(*Block) // called after each locally mined block is accepted
+
+	// Ready gates mining. While it returns false the miner idles instead of
+	// producing blocks — used to wait for initial synchronisation, so a new
+	// node does not burn energy extending a branch that the network will
+	// discard as soon as the real chain arrives.
+	Ready func() bool
 }
 
 // Mine mines count blocks paying rewards to addr (count <= 0: run until the
@@ -28,9 +34,26 @@ func MineLoop(ctx context.Context, c *Chain, addr [32]byte, count int, opts Mine
 		logf = func(string, ...any) {}
 	}
 	mined := 0
+	waiting := false
 	for count <= 0 || mined < count {
 		if ctx.Err() != nil {
 			return nil
+		}
+		if opts.Ready != nil && !opts.Ready() {
+			if !waiting {
+				logf("waiting for chain synchronisation before mining")
+				waiting = true
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		if waiting {
+			logf("synchronised — mining")
+			waiting = false
 		}
 		epoch := c.TipEpoch()
 		tmpl, err := c.NextBlockTemplate(addr)
