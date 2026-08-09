@@ -194,7 +194,19 @@ curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" -X POST \
      -d '{"to":"per1...","amount":"1.5"}' http://127.0.0.1:16181/send
 ```
 
-This is the integration surface for scripts, services and autonomous agents.
+Transactions may carry a public payment reference of up to 80 bytes — an
+invoice or order id — so a recipient can match a payment to an obligation
+without a side channel:
+
+```bash
+./perihelion send --to per1... --amount 0.25 --memo "invoice-7f3a91"
+```
+
+A service that only needs to *verify* payments should hold no keys at all. The
+block explorer serves a read-only JSON API for that purpose (`/api/status`,
+`/api/tx/{id}`, `/api/address/{addr}`), backed by a fully validating node.
+[AGENTS.md](AGENTS.md) describes the machine-payment case in full, including
+its limits.
 
 ## Security
 

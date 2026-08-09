@@ -296,7 +296,7 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 			http.Error(rw, "no wallet loaded", http.StatusBadRequest)
 			return
 		}
-		var req struct{ To, Amount, Fee string }
+		var req struct{ To, Amount, Fee, Memo string }
 		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 4096)).Decode(&req); err != nil {
 			http.Error(rw, "bad json", http.StatusBadRequest)
 			return
@@ -319,7 +319,7 @@ func startRPC(addr, token string, c *core.Chain, w *wallet.Wallet, node *p2p.Nod
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return
 		}
-		tx, err := wallet.BuildSend(c, w, to, amount, fee)
+		tx, err := wallet.BuildSendWithRef(c, w, to, amount, fee, []byte(req.Memo))
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
 			return

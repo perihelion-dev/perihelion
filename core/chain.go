@@ -27,6 +27,7 @@ var (
 	bUTXO    = []byte("utxo")
 	bMeta    = []byte("meta")
 	bMempool = []byte("mempool")
+	bTxIndex = []byte("txindex")
 
 	kTip       = []byte("tip")
 	kTipHeight = []byte("tipheight")
@@ -174,7 +175,7 @@ func Open(path string) (*Chain, error) {
 	}
 	c := &Chain{db: db}
 	err = db.Update(func(dbtx *bolt.Tx) error {
-		for _, name := range [][]byte{bBlocks, bHeight, bIndex, bUndo, bUTXO, bMeta, bMempool} {
+		for _, name := range [][]byte{bBlocks, bHeight, bIndex, bUndo, bUTXO, bMeta, bMempool, bTxIndex} {
 			if _, err := dbtx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -182,7 +183,14 @@ func Open(path string) (*Chain, error) {
 		meta := dbtx.Bucket(bMeta)
 		if tip := meta.Get(kTip); tip != nil {
 			if dbtx.Bucket(bIndex).Get(tip) == nil {
-				return rebuildIndex(dbtx)
+				if err := rebuildIndex(dbtx); err != nil {
+					return err
+				}
+			}
+			// Databases written before the transaction index existed carry an
+			// empty bucket; fill it once rather than degrading lookups forever.
+			if dbtx.Bucket(bTxIndex).Stats().KeyN == 0 && getU64(meta, kTipHeight) > 0 {
+				return rebuildTxIndex(dbtx)
 			}
 			return nil
 		}
@@ -246,6 +254,30 @@ func rebuildIndex(dbtx *bolt.Tx) error {
 	var wb [32]byte
 	work.FillBytes(wb[:])
 	return meta.Put(kTipWork, wb[:])
+}
+
+// rebuildTxIndex walks the active chain and records where every transaction
+// lives. Run once, when opening a database created before the index existed.
+func rebuildTxIndex(dbtx *bolt.Tx) error {
+	tipHeight := getU64(dbtx.Bucket(bMeta), kTipHeight)
+	idx := dbtx.Bucket(bTxIndex)
+	for h := uint64(0); h <= tipHeight; h++ {
+		hash := dbtx.Bucket(bHeight).Get(be64(h))
+		if hash == nil {
+			continue
+		}
+		b, err := readBlock(dbtx, hash)
+		if err != nil {
+			return err
+		}
+		for _, t := range b.Txs {
+			id := t.ID()
+			if err := idx.Put(id[:], be64(h)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Chain) Close() error { return c.db.Close() }
@@ -487,6 +519,7 @@ func connectTip(dbtx *bolt.Tx, b *Block, bh [32]byte) error {
 			}
 		}
 	}
+	txIndex := dbtx.Bucket(bTxIndex)
 	for _, t := range b.Txs {
 		id := t.ID()
 		for i := range t.Outputs {
@@ -499,6 +532,11 @@ func connectTip(dbtx *bolt.Tx, b *Block, bh [32]byte) error {
 			if err := utxos.Put(utxoKey(OutPoint{TxID: id, Index: uint32(i)}), u.serialize()); err != nil {
 				return err
 			}
+		}
+		// Record where each transaction lives, so looking one up is a single
+		// read rather than a scan over recent blocks.
+		if err := txIndex.Put(id[:], be64(height)); err != nil {
+			return err
 		}
 	}
 	if err := dbtx.Bucket(bUndo).Put(bh[:], undo.serialize()); err != nil {
@@ -587,12 +625,16 @@ func disconnectTip(dbtx *bolt.Tx) error {
 		return err
 	}
 	utxos := dbtx.Bucket(bUTXO)
+	txIndex := dbtx.Bucket(bTxIndex)
 	for _, t := range b.Txs {
 		id := t.ID()
 		for i := range t.Outputs {
 			if err := utxos.Delete(utxoKey(OutPoint{TxID: id, Index: uint32(i)})); err != nil {
 				return err
 			}
+		}
+		if err := txIndex.Delete(id[:]); err != nil {
+			return err
 		}
 	}
 	for i := range u.spentKeys {
@@ -872,6 +914,43 @@ func (c *Chain) BlockByHeight(h uint64) (*Block, error) {
 		return err
 	})
 	return blk, err
+}
+
+// TxByID returns a confirmed transaction and the height of the block holding
+// it. It is an index lookup, so it costs the same whether the transaction is
+// recent or ancient — which is what keeps a public lookup service from being
+// a denial-of-service lever.
+func (c *Chain) TxByID(id [32]byte) (*Tx, uint64, error) {
+	var (
+		tx     *Tx
+		height uint64
+	)
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		v := dbtx.Bucket(bTxIndex).Get(id[:])
+		if v == nil {
+			return fmt.Errorf("unknown transaction")
+		}
+		height = binary.BigEndian.Uint64(v)
+		hash := dbtx.Bucket(bHeight).Get(be64(height))
+		if hash == nil {
+			return fmt.Errorf("transaction indexed at a height that is no longer active")
+		}
+		b, err := readBlock(dbtx, hash)
+		if err != nil {
+			return err
+		}
+		for _, t := range b.Txs {
+			if t.ID() == id {
+				tx = t
+				return nil
+			}
+		}
+		return fmt.Errorf("transaction not present in its indexed block")
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return tx, height, nil
 }
 
 // TipInfo returns the active tip's height and hash.

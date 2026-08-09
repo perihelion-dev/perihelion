@@ -472,6 +472,7 @@ func cmdSend(args []string) error {
 	to := fs.String("to", "", "recipient address (per1...)")
 	amountStr := fs.String("amount", "", "amount in PER, e.g. 1.5")
 	feeStr := fs.String("fee", "0.001", "fee in PER (half is burned, half pays miners)")
+	memo := fs.String("memo", "", "public payment reference recorded in the transaction (invoice or order id; max 80 bytes)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -499,7 +500,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 	defer c.Close()
-	tx, err := wallet.BuildSend(c, w, toAddr, amount, fee)
+	tx, err := wallet.BuildSendWithRef(c, w, toAddr, amount, fee, []byte(*memo))
 	if err != nil {
 		return err
 	}
@@ -508,6 +509,9 @@ func cmdSend(args []string) error {
 	}
 	id := tx.ID()
 	fmt.Printf("Transaction accepted: %x\n", id[:])
+	if *memo != "" {
+		fmt.Printf("Reference (public, permanent): %s\n", *memo)
+	}
 	fmt.Printf("Sending %s PER (fee %s: %s burned forever, %s to the miner pool).\n",
 		core.FormatAmount(amount), core.FormatAmount(fee),
 		core.FormatAmount(fee/2), core.FormatAmount(fee-fee/2))

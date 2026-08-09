@@ -420,6 +420,23 @@ func DecodeAddress(s string) ([32]byte, error) { return core.DecodeAddress(s) }
 // BuildSend creates and signs a transaction sending amount (in peri) to `to`,
 // paying fee, with change returned to the wallet's own address.
 func BuildSend(c *core.Chain, w *Wallet, to [32]byte, amount, fee uint64) (*core.Tx, error) {
+	return BuildSendWithRef(c, w, to, amount, fee, nil)
+}
+
+// BuildSendWithRef is BuildSend with a payment reference recorded in the
+// transaction. The reference is public and permanent — it is committed to by
+// the transaction id and therefore by the block — so it is meant for invoice
+// or order identifiers that let a recipient match a payment automatically,
+// not for anything private. Keep it short; consensus caps it at
+// core.MaxTxExtra bytes.
+func BuildSendWithRef(c *core.Chain, w *Wallet, to [32]byte, amount, fee uint64, ref []byte) (*core.Tx, error) {
+	if len(ref) > core.MaxTxExtra {
+		return nil, fmt.Errorf("payment reference must be at most %d bytes", core.MaxTxExtra)
+	}
+	return buildSend(c, w, to, amount, fee, ref)
+}
+
+func buildSend(c *core.Chain, w *Wallet, to [32]byte, amount, fee uint64, ref []byte) (*core.Tx, error) {
 	if w.Locked() {
 		return nil, fmt.Errorf("wallet is locked — unlock it with your password first")
 	}
@@ -432,7 +449,7 @@ func BuildSend(c *core.Chain, w *Wallet, to [32]byte, amount, fee uint64) (*core
 		return nil, err
 	}
 	var sum uint64
-	tx := &core.Tx{}
+	tx := &core.Tx{Extra: ref}
 	for _, u := range utxos {
 		sum += u.Value
 		tx.Inputs = append(tx.Inputs, core.TxInput{Prev: u.Out})

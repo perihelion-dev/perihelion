@@ -22,6 +22,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"perihelion/core"
 	"perihelion/p2p"
@@ -147,6 +149,11 @@ func (e *explorer) routes() http.Handler {
 	mux.HandleFunc("/address/", e.handleAddress)
 	mux.HandleFunc("/supply", e.handleSupply)
 	mux.HandleFunc("/search", e.handleSearch)
+	mux.HandleFunc("/api", e.apiIndex)
+	mux.HandleFunc("/api/status", e.apiStatus)
+	mux.HandleFunc("/api/block/", e.apiBlock)
+	mux.HandleFunc("/api/tx/", e.apiTx)
+	mux.HandleFunc("/api/address/", e.apiAddress)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintln(w, "ok")
@@ -227,6 +234,204 @@ func (e *explorer) rateLimit(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// --- machine interface ---
+//
+// A read-only JSON API, so that a program — a payment processor, a service
+// billing for its work, an autonomous agent — can verify a payment with a
+// single HTTP request instead of running a node or trusting a wallet with
+// keys. Everything here is derived from a chain this process validated
+// itself. Nothing here can move funds.
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*") // public read-only data
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(v)
+}
+
+func apiError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (e *explorer) apiIndex(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service":  "perihelion-explorer",
+		"readonly": true,
+		"note":     "This endpoint serves chain data only. It holds no keys and cannot send transactions.",
+		"endpoints": map[string]string{
+			"GET /api/status":          "chain height, supply, difficulty, peers",
+			"GET /api/block/{height}":  "block by height, or by 64-hex hash",
+			"GET /api/tx/{txid}":       "confirmed transaction, its block height, and confirmations",
+			"GET /api/address/{per1…}": "confirmed balance of an address",
+		},
+		"units": "All amounts are decimal strings in PER. 1 PER = 100000000 peri.",
+	})
+}
+
+func (e *explorer) apiStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := e.chain.Stats()
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "chain unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"height":       st.Height,
+		"tip":          hex.EncodeToString(st.TipHash[:]),
+		"tip_time":     time.Unix(st.TipTime, 0).UTC().Format(time.RFC3339),
+		"circulating":  core.FormatAmount(st.Emitted - st.Burned),
+		"emitted":      core.FormatAmount(st.Emitted),
+		"burned":       core.FormatAmount(st.Burned),
+		"supply_bound": core.FormatAmount(core.MaxSupply),
+		"reward_pool":  core.FormatAmount(st.Pool),
+		"next_subsidy": core.FormatAmount(st.NextSubsidy),
+		"difficulty":   st.Difficulty.String(),
+		"mempool":      st.Mempool,
+		"peers":        e.node.PeerCount(),
+		"synced":       e.node.Synced(),
+	})
+}
+
+func (e *explorer) apiBlock(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/block/")
+	b, err := e.lookupBlock(id)
+	if err != nil {
+		apiError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	st, _ := e.chain.Stats()
+	hash := b.Header.Hash()
+	txs := make([]map[string]any, 0, len(b.Txs))
+	for _, t := range b.Txs {
+		txs = append(txs, txJSON(t))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"height":        b.Header.Height,
+		"hash":          hex.EncodeToString(hash[:]),
+		"prev_hash":     hex.EncodeToString(b.Header.PrevHash[:]),
+		"time":          time.Unix(b.Header.Time, 0).UTC().Format(time.RFC3339),
+		"difficulty":    core.DifficultyOf(b.Header.Target).String(),
+		"nonce":         b.Header.Nonce,
+		"confirmations": confirmations(st, b.Header.Height),
+		"transactions":  txs,
+	})
+}
+
+func confirmations(st *core.Stats, height uint64) uint64 {
+	if st == nil || st.Height < height {
+		return 0
+	}
+	return st.Height - height + 1
+}
+
+func txJSON(t *core.Tx) map[string]any {
+	id := t.ID()
+	ins := make([]map[string]any, 0, len(t.Inputs))
+	for i := range t.Inputs {
+		ins = append(ins, map[string]any{
+			"prev_txid": hex.EncodeToString(t.Inputs[i].Prev.TxID[:]),
+			"index":     t.Inputs[i].Prev.Index,
+		})
+	}
+	outs := make([]map[string]any, 0, len(t.Outputs))
+	var total uint64
+	for i := range t.Outputs {
+		total += t.Outputs[i].Value
+		outs = append(outs, map[string]any{
+			"address": core.EncodeAddress(t.Outputs[i].Addr),
+			"amount":  core.FormatAmount(t.Outputs[i].Value),
+		})
+	}
+	m := map[string]any{
+		"txid":      hex.EncodeToString(id[:]),
+		"coinbase":  t.IsCoinbase(),
+		"inputs":    ins,
+		"outputs":   outs,
+		"total_out": core.FormatAmount(total),
+	}
+	// A payment reference is arbitrary bytes chosen by the sender. It is
+	// offered both as text and as hex so a caller never has to guess an
+	// encoding, and printable form is omitted when it is not valid UTF-8.
+	if !t.IsCoinbase() && len(t.Extra) > 0 {
+		ref := map[string]any{"hex": hex.EncodeToString(t.Extra)}
+		if utf8.Valid(t.Extra) {
+			ref["text"] = string(t.Extra)
+		}
+		m["reference"] = ref
+	}
+	return m
+}
+
+func (e *explorer) apiTx(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/tx/")
+	raw, err := hex.DecodeString(idStr)
+	if err != nil || len(raw) != 32 {
+		apiError(w, http.StatusBadRequest, "a transaction id is 64 hexadecimal characters")
+		return
+	}
+	var id [32]byte
+	copy(id[:], raw)
+	t, height, err := e.chain.TxByID(id)
+	if err != nil {
+		apiError(w, http.StatusNotFound, "transaction not found in the confirmed chain")
+		return
+	}
+	st, _ := e.chain.Stats()
+	out := txJSON(t)
+	out["block_height"] = height
+	out["confirmations"] = confirmations(st, height)
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (e *explorer) apiAddress(w http.ResponseWriter, r *http.Request) {
+	enc := strings.TrimPrefix(r.URL.Path, "/api/address/")
+	addr, err := core.DecodeAddress(enc)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	spendable, immature, err := e.chain.Balance(addr)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "lookup failed")
+		return
+	}
+	st, _ := e.chain.Stats()
+	var height uint64
+	if st != nil {
+		height = st.Height
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"address":      core.EncodeAddress(addr),
+		"spendable":    core.FormatAmount(spendable),
+		"immature":     core.FormatAmount(immature),
+		"total":        core.FormatAmount(spendable + immature),
+		"as_of_height": height,
+	})
+}
+
+// lookupBlock resolves a height or a 64-character hash to a block.
+func (e *explorer) lookupBlock(id string) (*core.Block, error) {
+	if id == "" || len(id) > 64 {
+		return nil, errors.New("invalid block reference")
+	}
+	if h, err := strconv.ParseUint(id, 10, 64); err == nil {
+		return e.chain.BlockByHeight(h)
+	}
+	raw, err := hex.DecodeString(id)
+	if err != nil || len(raw) != 32 {
+		return nil, errors.New("a block is referenced by height or by its 64-character hash")
+	}
+	var hash [32]byte
+	copy(hash[:], raw)
+	rawBlock, ok := e.chain.RawBlockByHash(hash)
+	if !ok {
+		return nil, errors.New("unknown block")
+	}
+	return core.DeserializeBlock(rawBlock)
 }
 
 // --- pages ---
