@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -109,6 +110,8 @@ func main() {
 		err = cmdBlock(os.Args[2:])
 	case "governance":
 		err = cmdGovernance(os.Args[2:])
+	case "miners":
+		err = cmdMiners(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -138,6 +141,7 @@ Usage:
   perihelion info                              chain statistics
   perihelion block HEIGHT                      inspect a block
   perihelion governance                        list proposed rule changes and their network status
+  perihelion miners [--from N] [--to N]        who actually mined the blocks, by reward address
 
 All commands accept --datadir DIR (default ~/.perihelion).
 `)
@@ -176,6 +180,100 @@ func cmdGovernance(args []string) error {
 			fmt.Printf("  activation height %d", st.ActivationHeight)
 		}
 		fmt.Println()
+	}
+	return nil
+}
+
+// cmdMiners attributes blocks to the addresses their coinbase paid. This is
+// the only sound way to ask who mined: the peer a block arrived from merely
+// relayed it, and relaying says nothing about who found it.
+func cmdMiners(args []string) error {
+	fs := flag.NewFlagSet("miners", flag.ExitOnError)
+	datadir := fs.String("datadir", defaultDataDir(), "data directory")
+	from := fs.Uint64("from", 1, "first height to examine")
+	to := fs.Uint64("to", 0, "last height to examine (0 = chain tip)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := openChain(*datadir)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	st, err := c.Stats()
+	if err != nil {
+		return err
+	}
+	last := *to
+	if last == 0 || last > st.Height {
+		last = st.Height
+	}
+	if *from < 1 {
+		*from = 1
+	}
+
+	counts := map[[32]byte]uint64{}
+	rewards := map[[32]byte]uint64{}
+	var total uint64
+	for h := *from; h <= last; h++ {
+		b, err := c.BlockByHeight(h)
+		if err != nil {
+			return err
+		}
+		cb := b.Txs[0]
+		if len(cb.Outputs) == 0 {
+			continue
+		}
+		addr := cb.Outputs[0].Addr
+		var paid uint64
+		for i := range cb.Outputs {
+			paid += cb.Outputs[i].Value
+		}
+		counts[addr]++
+		rewards[addr] += paid
+		total++
+	}
+	if total == 0 {
+		fmt.Println("No blocks in that range.")
+		return nil
+	}
+
+	type row struct {
+		addr   [32]byte
+		blocks uint64
+		reward uint64
+	}
+	rows := make([]row, 0, len(counts))
+	for a, n := range counts {
+		rows = append(rows, row{a, n, rewards[a]})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].blocks > rows[j].blocks })
+
+	var mine [32]byte
+	haveWallet := false
+	if w, err := loadWalletAddr(*datadir); err == nil {
+		mine, haveWallet = w.Address(), true
+	}
+
+	fmt.Printf("Blocks %d–%d: %d blocks, %d distinct miners\n\n", *from, last, total, len(rows))
+	fmt.Printf("%-8s %-7s %-16s %s\n", "BLOCKS", "SHARE", "REWARDED", "ADDRESS")
+	for _, r := range rows {
+		tag := ""
+		if haveWallet && r.addr == mine {
+			tag = "  ← you"
+		}
+		fmt.Printf("%-8d %-7s %-16s %s%s\n",
+			r.blocks,
+			fmt.Sprintf("%.1f%%", float64(r.blocks)*100/float64(total)),
+			core.FormatAmount(r.reward)+" PER",
+			wallet.EncodeAddress(r.addr), tag)
+	}
+	// A single party holding a majority of recent blocks can rewrite recent
+	// history; say so rather than leaving the reader to notice.
+	if len(rows) > 0 && float64(rows[0].blocks)*100/float64(total) > 50 {
+		fmt.Printf("\nWARNING: one address mined %.1f%% of this range. A majority of hashrate\n",
+			float64(rows[0].blocks)*100/float64(total))
+		fmt.Println("can reorganise recent blocks. Treat confirmations here with caution.")
 	}
 	return nil
 }
