@@ -13,8 +13,16 @@ import (
 )
 
 const (
-	maxPeers    = 32
-	maxOrphans  = 128
+	maxPeers = 64
+
+	// maxPeersPerHost bounds how many connections one address may hold. A
+	// single host — buggy, over-eager or hostile — otherwise fills the peer
+	// table and crowds everyone else out; observed in practice, where one
+	// participant held 24 of 32 slots on the seed. The limit is set well above
+	// what a household running several machines behind one address needs.
+	maxPeersPerHost = 6
+
+	maxOrphans = 128
 	maxSeenTx   = 16384
 	syncBatch   = 200
 	reqThrottle = 2 * time.Second
@@ -394,6 +402,19 @@ func (n *Node) PeerCount() int {
 	return len(n.peers)
 }
 
+// peersFromHost counts current connections sharing an address.
+func (n *Node) peersFromHost(host string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	count := 0
+	for name := range n.peers {
+		if hostOf(name) == host {
+			count++
+		}
+	}
+	return count
+}
+
 // KnownAddrs returns the endpoints this node could dial, for status display.
 func (n *Node) KnownAddrs() []string { return n.book.sample(maxAddrBook) }
 
@@ -404,10 +425,11 @@ func (n *Node) acceptLoop(ln net.Listener) {
 		if err != nil {
 			return // listener closed
 		}
+		host := hostOf(conn.RemoteAddr().String())
 		n.mu.Lock()
 		full := len(n.peers) >= maxPeers
 		n.mu.Unlock()
-		if full || n.isBanned(hostOf(conn.RemoteAddr().String())) {
+		if full || n.isBanned(host) || n.peersFromHost(host) >= maxPeersPerHost {
 			conn.Close()
 			continue
 		}
@@ -516,8 +538,18 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	p.mu.Unlock()
 	n.learnAddr(advertised, p)
 
+	// Re-check under the lock: several handshakes from one host can be in
+	// flight at once, so the accept-time check alone does not bound the table.
+	host := hostOf(p.name)
 	n.mu.Lock()
-	if _, dup := n.peers[p.name]; dup || len(n.peers) >= maxPeers {
+	sameHost := 0
+	for name := range n.peers {
+		if hostOf(name) == host {
+			sameHost++
+		}
+	}
+	_, dup := n.peers[p.name]
+	if dup || len(n.peers) >= maxPeers || sameHost >= maxPeersPerHost {
 		n.mu.Unlock()
 		return
 	}

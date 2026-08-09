@@ -259,3 +259,7 @@ func (b *addrBook) save() {
 		os.Rename(tmp, path)
 	}
 }
+
+// MaxPeersPerHostForTest exposes the per-host connection limit to tests in
+// other packages.
+const MaxPeersPerHostForTest = maxPeersPerHost
