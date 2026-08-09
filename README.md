@@ -28,25 +28,38 @@ not the decade behind:
    out 1/14,400 of its balance to each block's miner (a ~10-day smoothing
    window). Miner income never falls off a cliff and grows with network usage.
 
+## Mainnet
+
+Genesis: **2026-08-09 00:00:00 UTC**. No premine, no founder allocation, no
+token sale — the genesis block pays nobody. Every PER in existence was mined
+after that instant by whoever was running a node.
+
+The genesis block commits to this message:
+
+> Perihelion genesis 2026-08-09 — quantum-safe money, mined by everyone, owned by no one
+
 ## Quick start
 
 ```
 go build ./cmd/perihelion
-./perihelion wallet new
-./perihelion mine                     # solo mining
+./perihelion wallet new               # password + 24-word recovery phrase
+./perihelion node --mine              # join the network and mine
 ./perihelion balance
 ./perihelion send --to per1... --amount 1.5
 ./perihelion info
 ```
 
-Run a networked node (P2P gossip + sync + local RPC):
-
-```
-./perihelion node --connect seed.example.org:16180 --mine
-```
+A fresh node bootstraps from the public seed automatically. To use your own
+peers instead, list them in `~/.perihelion/seeds.txt` (one `host:port` per
+line) or pass `--connect host:port`. Run your own seed with
+`--listen :16180` on an open port — the network needs no permission to grow.
 
 One binary, no configuration. Mining uses your CPU cores with Argon2id
 (64 MiB per attempt) — the same hardware budget for everyone.
+
+There is also a **desktop wallet** (`cmd/perihelion-app`) for macOS, Windows
+and Linux with an embedded node and miner: create or restore a wallet, watch
+blocks arrive, send PER — no terminal required.
 
 ## Local RPC (the machine interface)
 
@@ -74,20 +87,28 @@ curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" -X POST \
 
 ## Status
 
-Experimental. Milestones 1–2 are complete: a fully validating chain with
-post-quantum wallets, mining, fork choice with atomic reorgs (heaviest chain
-wins), P2P block/tx gossip with initial sync, and a local RPC. Covered by
-end-to-end, adversarial and two-node network tests. Not yet audited; do not
-store value you cannot afford to lose.
+**Early and experimental.** The chain validates fully, mines, syncs, reorgs
+and sends — covered by end-to-end, adversarial and multi-node network tests.
+But it is young, it has not been audited, and its hashrate is small: a new
+chain is cheap to attack until enough independent miners join. Do not store
+value you cannot afford to lose, and do not treat PER as an investment.
 
 Roadmap:
 - [x] P2P networking: gossip, sync, fork choice (heaviest chain), reorgs
 - [x] Local JSON-RPC API (wallet + status)
-- [ ] Public testnet with seed nodes
-- [ ] Wallet file encryption (passphrase)
+- [x] Encrypted wallets (Argon2id + AES-256-GCM) with 24-word recovery phrases
+- [x] Desktop wallet with embedded node and miner
+- [x] Mainnet genesis
+- [ ] More independent seed nodes (run one!)
 - [ ] Block explorer
 - [ ] Independent security review
-- [ ] Mainnet genesis
+- [ ] Reproducible builds and signed releases
+
+## Contributing
+
+Run a node. Mine. Read the consensus code in `core/` — it is deliberately
+small enough to audit in an afternoon. Report anything that looks wrong.
+There is no company here and no token to buy; the code is the whole story.
 
 ## License
 

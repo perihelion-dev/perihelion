@@ -22,6 +22,11 @@ const (
 	MaxPayload      = 4 << 20
 	DefaultPort     = 16180
 
+	// DefaultSeed is the public bootstrap node a fresh install dials to join
+	// the network. Seeds are only entry points: once a node has peers it no
+	// longer depends on them, and anyone can run one.
+	DefaultSeed = "186.240.157.169:16180"
+
 	msgHello          = 1
 	msgGetBlocks      = 2
 	msgBlock          = 3

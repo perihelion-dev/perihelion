@@ -255,13 +255,15 @@ func (c *Chain) Close() error { return c.db.Close() }
 func (c *Chain) TipEpoch() uint64 { return c.epoch.Load() }
 
 // GenesisBlock is the hardcoded block 0. It carries no transactions and no
-// reward — the fair-launch anchor of the timeline.
+// reward — the fair-launch anchor of the timeline. Its merkle root commits to
+// GenesisMessage instead of a transaction list.
 func GenesisBlock() *Block {
 	return &Block{Header: BlockHeader{
-		Version: 1,
-		Height:  0,
-		Time:    GenesisTime,
-		Target:  TargetToBytes(InitialTarget()),
+		Version:    1,
+		Height:     0,
+		Time:       GenesisTime,
+		MerkleRoot: H([]byte("PER:genesis"), []byte(GenesisMessage)),
+		Target:     TargetToBytes(InitialTarget()),
 	}}
 }
 

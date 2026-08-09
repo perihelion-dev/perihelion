@@ -37,13 +37,20 @@ const (
 	MaxTxExtra           = 80
 	MinRelayFee   uint64 = 1_000 // peri
 
-	// GenesisTime: 2026-08-08 00:00:00 UTC. The genesis block carries no
-	// reward: fair launch, no premine.
-	GenesisTime int64 = 1_786_147_200
+	// GenesisTime: 2026-08-09 00:00:00 UTC — the mainnet start. The genesis
+	// block carries no reward and no transactions: fair launch, no premine,
+	// no founder allocation. Every PER in existence was mined after this
+	// instant, by whoever was running a node.
+	GenesisTime int64 = 1_786_233_600
 
 	// MaxFutureDrift bounds how far a block timestamp may run ahead of wall clock.
 	MaxFutureDrift int64 = 120
 )
+
+// GenesisMessage is committed to by the genesis block's merkle root. It fixes
+// the chain's identity: any chain built on a different message is a different
+// currency and can never merge with this one.
+const GenesisMessage = "Perihelion genesis 2026-08-09 — quantum-safe money, mined by everyone, owned by no one"
 
 // Argon2id proof-of-work parameters. Consensus-critical: changing them forks
 // the chain. Declared as variables only so tests can shrink the memory cost.

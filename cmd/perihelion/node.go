@@ -25,7 +25,7 @@ func cmdNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	datadir := fs.String("datadir", defaultDataDir(), "data directory")
 	listen := fs.String("listen", fmt.Sprintf(":%d", p2p.DefaultPort), `P2P listen address ("off" to disable — outbound connections only)`)
-	connect := fs.String("connect", "", "comma-separated peer addresses (host:port)")
+	connect := fs.String("connect", "", `comma-separated peer addresses (host:port); empty uses ~/.perihelion/seeds.txt or the built-in seed, "none" disables outbound`)
 	mine := fs.Bool("mine", false, "mine while running the node")
 	mineto := fs.String("mineto", "", "mine to this address instead of the local wallet (per1...); lets a server mine without holding any keys")
 	threads := fs.Int("threads", 0, "mining threads (0 = automatic)")
@@ -72,7 +72,12 @@ func cmdNode(args []string) error {
 		listenAddr = ""
 	}
 	var peers []string
-	if *connect != "" {
+	switch *connect {
+	case "none":
+		// no outbound connections
+	case "":
+		peers = seedPeers(*datadir)
+	default:
 		for _, pa := range strings.Split(*connect, ",") {
 			if pa = strings.TrimSpace(pa); pa != "" {
 				peers = append(peers, pa)
@@ -124,6 +129,25 @@ func cmdNode(args []string) error {
 		scancel()
 	}
 	return nil
+}
+
+// seedPeers returns the bootstrap peers: the operator's own seeds.txt if
+// present (one host:port per line, # comments), otherwise the built-in seed.
+func seedPeers(datadir string) []string {
+	var out []string
+	if data, err := os.ReadFile(filepath.Join(datadir, "seeds.txt")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			out = append(out, line)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, p2p.DefaultSeed)
+	}
+	return out
 }
 
 // rpcToken loads or creates the shared-secret token protecting the local RPC.
