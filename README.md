@@ -98,6 +98,11 @@ fee-sniping incentive that destabilises fee-only chains.
 
 ## Installation
 
+Perihelion is distributed as **source only**. There are no prebuilt binaries
+and no installers — you compile it yourself, from code you can read. That is
+deliberate: a wallet binary handed to you by someone else is a binary you have
+to trust, and this project would rather be verifiable than convenient.
+
 Requires Go 1.26 or later.
 
 ```bash
@@ -105,6 +110,9 @@ git clone https://github.com/perihelion-dev/perihelion.git
 cd perihelion
 go build ./cmd/perihelion
 ```
+
+Anyone offering a precompiled Perihelion wallet is not doing so on behalf of
+this project. Build it yourself, or read the code of whoever built it for you.
 
 ## Usage
 
@@ -195,10 +203,19 @@ The `core` and `wallet` packages contain no networking code whatsoever.
 pinned by hash and limited to Cloudflare CIRCL (ML-DSA), `golang.org/x/crypto`
 (Argon2id) and bbolt (storage). `govulncheck` reports no known vulnerabilities.
 
+**Recovery phrases.** The 24-word phrase is the sole backup that matters, and
+it is shown once, on screen. The desktop wallet can copy it to the clipboard,
+but only behind an explicit warning and it overwrites the clipboard afterwards
+— the system clipboard is readable by every other program on the machine and
+may sync to other devices. Write the words down on paper.
+
 **What is not yet true.** The code has not received an independent security
-audit. The network is young, and a chain with modest hashrate is inexpensive to
-attack until enough independent miners participate. Treat Perihelion as
-experimental software, not as a store of value.
+audit. Secrets are overwritten in memory where practical, but Go offers no
+guarantee against copies left by the garbage collector, so a compromised
+operating system defeats any software wallet including this one. The network
+is young, and a chain with modest hashrate is inexpensive to attack until
+enough independent miners participate. Treat Perihelion as experimental
+software, not as a store of value.
 
 ## Genesis
 
@@ -220,9 +237,10 @@ rules that applied equally to everyone.
 - [x] Encrypted wallets with 24-word recovery phrases
 - [x] Desktop wallet with embedded node and miner
 - [x] Mainnet genesis
+- [x] Network-activated governance (miner signalling)
 - [ ] Additional independent seed nodes
 - [ ] Block explorer
-- [ ] Reproducible builds and signed releases
+- [ ] Reproducible builds, so independently compiled binaries can be compared
 - [ ] Independent security audit
 
 ## Governance

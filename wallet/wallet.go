@@ -37,7 +37,23 @@ const (
 	argonTime    = 3
 	argonMemKiB  = 64 * 1024
 	argonThreads = 4
+
+	// Upper bounds accepted when reading a wallet file. The parameters are
+	// stored per wallet so that future versions can strengthen them, but a
+	// tampered file must not be able to demand an unbounded allocation.
+	maxArgonTime    = 16
+	maxArgonMemKiB  = 1024 * 1024 // 1 GiB
+	maxArgonThreads = 16
 )
+
+// zero overwrites a secret buffer once it is no longer needed. Go offers no
+// guarantee against copies made by the garbage collector, so this narrows the
+// window rather than closing it.
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
 
 // New generates a fresh in-memory keypair with no seed phrase and no
 // encryption. Used for tests and ephemeral keys; real wallets use Create.
@@ -66,6 +82,7 @@ func Create(password string) (w *Wallet, mnemonic string, err error) {
 		return nil, "", err
 	}
 	w, err = fromEntropy(entropy, password)
+	zero(entropy)
 	if err != nil {
 		return nil, "", err
 	}
@@ -105,6 +122,7 @@ func fromEntropy(entropy []byte, password string) (*Wallet, error) {
 	}
 	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemKiB, argonThreads, 32)
 	gcm, err := newGCM(key)
+	zero(key)
 	if err != nil {
 		return nil, err
 	}
@@ -148,8 +166,12 @@ func (w *Wallet) Unlock(password string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.checkKDFParams(); err != nil {
+		return err
+	}
 	key := argon2.IDKey([]byte(password), salt, e.Time, e.MemKiB, e.Threads, 32)
 	gcm, err := newGCM(key)
+	zero(key)
 	if err != nil {
 		return err
 	}
@@ -158,7 +180,22 @@ func (w *Wallet) Unlock(password string) error {
 		return fmt.Errorf("wrong password")
 	}
 	pub, priv := core.SigScheme.DeriveKey(entropy)
+	zero(entropy)
 	w.pub, w.priv = pub, priv
+	return nil
+}
+
+// checkKDFParams rejects key-derivation parameters outside the supported
+// range, so a tampered wallet file cannot force a pathological allocation.
+func (e *encFile) checkKDFParams() error {
+	if e.KDF != "argon2id" {
+		return fmt.Errorf("unsupported key derivation %q", e.KDF)
+	}
+	if e.Time == 0 || e.Time > maxArgonTime ||
+		e.MemKiB == 0 || e.MemKiB > maxArgonMemKiB ||
+		e.Threads == 0 || e.Threads > maxArgonThreads {
+		return fmt.Errorf("wallet file declares unsupported key-derivation parameters")
+	}
 	return nil
 }
 
@@ -173,12 +210,16 @@ func (w *Wallet) RevealMnemonic(password string) (string, error) {
 		return "", fmt.Errorf("this wallet has no recovery phrase")
 	}
 	e := w.enc
+	if err := e.checkKDFParams(); err != nil {
+		return "", err
+	}
 	salt, _ := unb64(e.Salt)
 	nonce, _ := unb64(e.Nonce)
 	ct, _ := unb64(e.Ciphertext)
 	pb, _ := unb64(e.Pub)
 	key := argon2.IDKey([]byte(password), salt, e.Time, e.MemKiB, e.Threads, 32)
 	gcm, err := newGCM(key)
+	zero(key)
 	if err != nil {
 		return "", err
 	}
@@ -186,7 +227,9 @@ func (w *Wallet) RevealMnemonic(password string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("wrong password")
 	}
-	return entropyToMnemonic(entropy)
+	m, err := entropyToMnemonic(entropy)
+	zero(entropy)
+	return m, err
 }
 
 func newGCM(key []byte) (cipher.AEAD, error) {
