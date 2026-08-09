@@ -166,14 +166,21 @@ own peers, list them in `~/.perihelion/seeds.txt` (one `host:port` per line) or
 pass `--connect host:port`. `--connect none` disables outbound connections
 entirely.
 
-To operate a public seed node, accept inbound connections on the default port:
+Seeds are only an entry point. Once connected, nodes exchange the endpoints of
+other nodes that accept inbound connections, dial up to eight peers spread
+across distinct network prefixes, and remember what they learned in
+`~/.perihelion/peers.txt` — so after the first run a node rejoins the network
+without consulting any seed at all. A node that does not listen is never
+advertised to anyone.
+
+To operate a public node that others can find and connect to:
 
 ```bash
-./perihelion node --listen :16180
+./perihelion node --listen :16180 --advertise your.public.ip:16180
 ```
 
-The network requires no permission to grow. Anyone may run a seed, and nodes
-depend on seeds only until they have peers of their own.
+The network requires no permission to grow. Anyone may run a public node, and
+the more that do, the less any single operator matters.
 
 ### Local RPC
 

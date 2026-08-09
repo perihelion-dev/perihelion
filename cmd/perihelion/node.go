@@ -30,6 +30,7 @@ func cmdNode(args []string) error {
 	mineto := fs.String("mineto", "", "mine to this address instead of the local wallet (per1...); lets a server mine without holding any keys")
 	threads := fs.Int("threads", 0, "mining threads (0 = automatic)")
 	signalNames := fs.String("signal", "", "comma-separated deployment names this node's miner supports (see `perihelion governance`)")
+	advertise := fs.String("advertise", "", "public host:port to announce to peers (needed when --listen binds a wildcard address)")
 	rpcAddr := fs.String("rpc", "127.0.0.1:16181", `local RPC + dashboard address ("off" to disable)`)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -83,6 +84,10 @@ func cmdNode(args []string) error {
 	}
 
 	node := p2p.New(c, logf)
+	node.SetPeerStore(filepath.Join(*datadir, "peers.txt"))
+	if *advertise != "" {
+		node.SetAdvertisedAddress(*advertise)
+	}
 	listenAddr := *listen
 	if listenAddr == "off" {
 		listenAddr = ""

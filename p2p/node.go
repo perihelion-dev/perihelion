@@ -25,10 +25,12 @@ const (
 	isolationGrace = 90 * time.Second
 )
 
-// Node gossips blocks and transactions with configured peers and keeps the
-// local chain in sync. It only ever connects to addresses the operator
-// explicitly configured — there is no peer discovery, no NAT punching, no
-// hidden endpoints.
+// Node gossips blocks and transactions, keeps the local chain in sync, and
+// discovers further peers so that the network forms a mesh rather than a star
+// around its seeds. Discovery is address gossip only: nodes exchange endpoints
+// of other nodes that accept inbound connections. There is no NAT punching, no
+// rendezvous server and no telemetry; a node that does not listen advertises
+// nothing about itself.
 type Node struct {
 	chain *core.Chain
 	logf  func(string, ...any)
@@ -47,6 +49,13 @@ type Node struct {
 	listener net.Listener
 
 	startedAt time.Time
+	book      *addrBook
+
+	advMu       sync.Mutex
+	advertised  string          // our own listen address, empty if we do not listen
+	dialing     map[string]bool // discovery dials in flight
+	seedAddrs   []string
+	discoveryOn bool
 }
 
 // Synced reports whether this node has caught up with the best chain any peer
@@ -76,14 +85,17 @@ func (n *Node) Synced() bool {
 }
 
 type peer struct {
-	name string
-	conn net.Conn
+	name     string
+	conn     net.Conn
+	outbound bool
+	local    bool // peer is on loopback or a private network
 
 	wmu sync.Mutex // serializes frame writes
 
-	mu      sync.Mutex
-	height  uint64
-	lastReq time.Time
+	mu         sync.Mutex
+	height     uint64
+	lastReq    time.Time
+	advertised string // the address this peer listens on, if it accepts connections
 }
 
 func (p *peer) send(t byte, payload []byte) error {
@@ -107,11 +119,36 @@ func New(chain *core.Chain, logf func(string, ...any)) *Node {
 		waiting:   map[[32]byte][][32]byte{},
 		seenTx:    map[[32]byte]struct{}{},
 		startedAt: time.Now(),
+		book:      newAddrBook(),
+		dialing:   map[string]bool{},
 	}
 }
 
+// SetPeerStore enables persistence of discovered peers, loading any previously
+// known endpoints so that a restarted node rejoins the network without
+// consulting its seeds again.
+func (n *Node) SetPeerStore(path string) { n.book.load(path) }
+
+// SetAdvertisedAddress overrides the endpoint this node announces to peers.
+// Needed when the listening socket is behind a port mapping and the address
+// the node binds locally is not the one others can reach.
+func (n *Node) SetAdvertisedAddress(addr string) {
+	if a, err := normalizeAddr(addr); err == nil {
+		n.advMu.Lock()
+		n.advertised = a
+		n.advMu.Unlock()
+	}
+}
+
+func (n *Node) advertisedAddr() string {
+	n.advMu.Lock()
+	defer n.advMu.Unlock()
+	return n.advertised
+}
+
 // Start begins listening (if listen != "") and dials the configured peers,
-// reconnecting with backoff for as long as the node runs.
+// reconnecting with backoff for as long as the node runs. Once connected it
+// discovers further peers through address gossip.
 func (n *Node) Start(listen string, connect []string) error {
 	if listen != "" {
 		ln, err := net.Listen("tcp", listen)
@@ -122,17 +159,108 @@ func (n *Node) Start(listen string, connect []string) error {
 		n.listener = ln
 		n.lnMu.Unlock()
 		n.logf("p2p: listening on %s", ln.Addr())
+		// Only announce a concrete, reachable endpoint. A wildcard bind tells
+		// peers nothing useful, so in that case the operator must supply the
+		// public address explicitly via SetAdvertisedAddress.
+		if host, port, err := net.SplitHostPort(ln.Addr().String()); err == nil {
+			if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() && n.advertisedAddr() == "" {
+				n.SetAdvertisedAddress(net.JoinHostPort(host, port))
+			}
+		}
 		n.wg.Add(1)
 		go n.acceptLoop(ln)
 	}
+	n.advMu.Lock()
+	n.seedAddrs = append(n.seedAddrs, connect...)
+	n.discoveryOn = true
+	n.advMu.Unlock()
 	for _, addr := range connect {
+		n.book.add(addr, "") // operator-configured: never evicted
 		addr := addr
 		n.wg.Add(1)
 		go n.dialLoop(addr)
 	}
 	n.wg.Add(1)
 	go n.keepaliveLoop()
+	n.wg.Add(1)
+	go n.discoveryLoop()
 	return nil
+}
+
+// discoveryLoop keeps outbound connections topped up from the address book,
+// spreading them across distinct network prefixes so that no single operator
+// can supply all of this node's view of the chain.
+func (n *Node) discoveryLoop() {
+	defer n.wg.Done()
+	t := time.NewTicker(discoveryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+			n.book.save()
+			connected := map[string]bool{}
+			groups := map[string]int{}
+			outbound := 0
+			n.mu.Lock()
+			for _, p := range n.peers {
+				p.mu.Lock()
+				if p.advertised != "" {
+					connected[p.advertised] = true
+				}
+				p.mu.Unlock()
+				connected[p.name] = true
+				if p.outbound {
+					outbound++
+					groups[group(p.name)]++
+				}
+			}
+			n.mu.Unlock()
+			if outbound >= targetOutbound {
+				continue
+			}
+			n.advMu.Lock()
+			for _, s := range n.seedAddrs {
+				connected[s] = true // already has its own persistent dial loop
+			}
+			n.advMu.Unlock()
+			for _, cand := range n.book.candidates(connected, groups) {
+				if outbound >= targetOutbound {
+					break
+				}
+				n.advMu.Lock()
+				busy := n.dialing[cand]
+				if !busy {
+					n.dialing[cand] = true
+				}
+				n.advMu.Unlock()
+				if busy {
+					continue
+				}
+				outbound++
+				n.wg.Add(1)
+				go n.discoveryDial(cand)
+			}
+		}
+	}
+}
+
+func (n *Node) discoveryDial(addr string) {
+	defer n.wg.Done()
+	defer func() {
+		n.advMu.Lock()
+		delete(n.dialing, addr)
+		n.advMu.Unlock()
+	}()
+	if n.advertisedAddr() == addr {
+		return // never dial ourselves
+	}
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return
+	}
+	n.handleConn(conn, true)
 }
 
 // Addr returns the actual listen address (useful with ":0" in tests).
@@ -166,6 +294,9 @@ func (n *Node) PeerCount() int {
 	return len(n.peers)
 }
 
+// KnownAddrs returns the endpoints this node could dial, for status display.
+func (n *Node) KnownAddrs() []string { return n.book.sample(maxAddrBook) }
+
 func (n *Node) acceptLoop(ln net.Listener) {
 	defer n.wg.Done()
 	for {
@@ -183,7 +314,7 @@ func (n *Node) acceptLoop(ln net.Listener) {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
-			n.handleConn(conn)
+			n.handleConn(conn, false)
 		}()
 	}
 }
@@ -193,7 +324,7 @@ func (n *Node) dialLoop(addr string) {
 	for n.ctx.Err() == nil {
 		conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 		if err == nil {
-			n.handleConn(conn)
+			n.handleConn(conn, true)
 		} else {
 			n.logf("p2p: cannot reach %s (%v), retrying", addr, err)
 		}
@@ -227,9 +358,21 @@ func (n *Node) keepaliveLoop() {
 func (n *Node) helloPayload() []byte {
 	height, tip, err := n.chain.TipInfo()
 	if err != nil {
-		return encodeHello(ProtocolVersion, 0, [32]byte{})
+		return encodeHello(ProtocolVersion, 0, [32]byte{}, n.advertisedAddr())
 	}
-	return encodeHello(ProtocolVersion, height, tip)
+	return encodeHello(ProtocolVersion, height, tip, n.advertisedAddr())
+}
+
+// isLocalConn reports whether the other end of a connection is on loopback or
+// a private network, which decides whether we accept non-routable addresses
+// from it.
+func isLocalConn(conn net.Conn) bool {
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
 
 // broadcast sends a frame to every connected peer except skip.
@@ -249,9 +392,14 @@ func (n *Node) broadcast(t byte, payload []byte, skip *peer) {
 	}
 }
 
-func (n *Node) handleConn(conn net.Conn) {
+func (n *Node) handleConn(conn net.Conn, outbound bool) {
 	defer conn.Close()
-	p := &peer{name: conn.RemoteAddr().String(), conn: conn}
+	p := &peer{
+		name:     conn.RemoteAddr().String(),
+		conn:     conn,
+		outbound: outbound,
+		local:    isLocalConn(conn),
+	}
 	if err := p.send(msgHello, n.helloPayload()); err != nil {
 		return
 	}
@@ -259,13 +407,14 @@ func (n *Node) handleConn(conn net.Conn) {
 	if err != nil || t != msgHello {
 		return
 	}
-	ver, height, _, err := decodeHello(payload)
+	ver, height, _, advertised, err := decodeHello(payload)
 	if err != nil || ver != ProtocolVersion {
 		return
 	}
 	p.mu.Lock()
 	p.height = height
 	p.mu.Unlock()
+	n.learnAddr(advertised, p)
 
 	n.mu.Lock()
 	if _, dup := n.peers[p.name]; dup || len(n.peers) >= maxPeers {
@@ -282,6 +431,7 @@ func (n *Node) handleConn(conn net.Conn) {
 		n.logf("p2p: disconnected from %s", p.name)
 	}()
 
+	p.send(msgGetAddr, nil)
 	n.maybeSync(p)
 	for {
 		t, payload, err := readFrame(conn)
@@ -312,13 +462,58 @@ func (n *Node) maybeSync(p *peer) {
 	}
 }
 
+// learnAddr records an endpoint a peer told us about, subject to the address
+// book's limits and to the rule that non-routable addresses are accepted only
+// from peers that are themselves local.
+func (n *Node) learnAddr(addr string, from *peer) {
+	if addr == "" {
+		return
+	}
+	norm, err := normalizeAddr(addr)
+	if err != nil || !routable(norm, from.local) {
+		return
+	}
+	if norm == n.advertisedAddr() {
+		return
+	}
+	if from != nil {
+		from.mu.Lock()
+		if from.advertised == "" {
+			from.advertised = norm
+		}
+		from.mu.Unlock()
+	}
+	n.book.add(norm, from.name)
+}
+
 func (n *Node) dispatch(p *peer, t byte, payload []byte) error {
 	switch t {
-	case msgHello:
-		_, height, _, err := decodeHello(payload)
+	case msgGetAddr:
+		return p.send(msgAddr, encodeAddrs(n.book.sample(MaxAddrPerMessage)))
+	case msgAddr:
+		addrs, err := decodeAddrs(payload)
 		if err != nil {
 			return err
 		}
+		learned := 0
+		for _, a := range addrs {
+			norm, err := normalizeAddr(a)
+			if err != nil || !routable(norm, p.local) || norm == n.advertisedAddr() {
+				continue
+			}
+			if n.book.add(norm, p.name) {
+				learned++
+			}
+		}
+		if learned > 0 {
+			n.logf("p2p: learned %d new peer address(es) from %s (%d known)", learned, p.name, n.book.size())
+		}
+	case msgHello:
+		_, height, _, advertised, err := decodeHello(payload)
+		if err != nil {
+			return err
+		}
+		n.learnAddr(advertised, p)
 		p.mu.Lock()
 		p.height = height
 		p.mu.Unlock()

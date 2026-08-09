@@ -32,6 +32,16 @@ const (
 	msgBlock          = 3
 	msgTx             = 4
 	msgGetBlockByHash = 5
+	msgGetAddr        = 6
+	msgAddr           = 7
+
+	// MaxAddrPerMessage bounds a peer-list message. Address gossip is the
+	// classic vector for eclipse attacks — an adversary floods a victim's
+	// address book with endpoints it controls until every connection leads
+	// back to it — so the amount of address data one peer can inject is
+	// capped here and again in the address book.
+	MaxAddrPerMessage = 64
+	MaxAddrLen        = 64
 )
 
 func writeFrame(conn net.Conn, t byte, payload []byte) error {
@@ -70,21 +80,77 @@ func readFrame(conn net.Conn) (byte, []byte, error) {
 	return hdr[4], p, nil
 }
 
-func encodeHello(ver uint32, height uint64, tip [32]byte) []byte {
-	out := make([]byte, 44)
+// encodeHello writes the handshake. Nodes that accept inbound connections
+// append the address they listen on so that others can reach them directly;
+// nodes that do not listen append nothing and stay unreachable by design.
+func encodeHello(ver uint32, height uint64, tip [32]byte, listenAddr string) []byte {
+	out := make([]byte, 44, 44+2+len(listenAddr))
 	binary.BigEndian.PutUint32(out[0:4], ver)
 	binary.BigEndian.PutUint64(out[4:12], height)
 	copy(out[12:44], tip[:])
+	if len(listenAddr) > MaxAddrLen {
+		listenAddr = ""
+	}
+	out = append(out, byte(len(listenAddr)>>8), byte(len(listenAddr)))
+	return append(out, listenAddr...)
+}
+
+func decodeHello(p []byte) (ver uint32, height uint64, tip [32]byte, listenAddr string, err error) {
+	if len(p) < 44 {
+		return 0, 0, tip, "", fmt.Errorf("bad hello")
+	}
+	copy(tip[:], p[12:44])
+	ver = binary.BigEndian.Uint32(p[0:4])
+	height = binary.BigEndian.Uint64(p[4:12])
+	if len(p) >= 46 {
+		n := int(p[44])<<8 | int(p[45])
+		if n > MaxAddrLen || 46+n > len(p) {
+			return 0, 0, tip, "", fmt.Errorf("bad hello address")
+		}
+		listenAddr = string(p[46 : 46+n])
+	}
+	return ver, height, tip, listenAddr, nil
+}
+
+func encodeAddrs(addrs []string) []byte {
+	if len(addrs) > MaxAddrPerMessage {
+		addrs = addrs[:MaxAddrPerMessage]
+	}
+	out := make([]byte, 0, 2+len(addrs)*24)
+	out = append(out, byte(len(addrs)>>8), byte(len(addrs)))
+	for _, a := range addrs {
+		if len(a) > MaxAddrLen {
+			continue
+		}
+		out = append(out, byte(len(a)))
+		out = append(out, a...)
+	}
 	return out
 }
 
-func decodeHello(p []byte) (uint32, uint64, [32]byte, error) {
-	var tip [32]byte
-	if len(p) != 44 {
-		return 0, 0, tip, fmt.Errorf("bad hello")
+func decodeAddrs(p []byte) ([]string, error) {
+	if len(p) < 2 {
+		return nil, fmt.Errorf("bad addr message")
 	}
-	copy(tip[:], p[12:44])
-	return binary.BigEndian.Uint32(p[0:4]), binary.BigEndian.Uint64(p[4:12]), tip, nil
+	n := int(p[0])<<8 | int(p[1])
+	if n > MaxAddrPerMessage {
+		return nil, fmt.Errorf("too many addresses")
+	}
+	out := make([]string, 0, n)
+	off := 2
+	for i := 0; i < n; i++ {
+		if off >= len(p) {
+			return nil, fmt.Errorf("truncated addr message")
+		}
+		l := int(p[off])
+		off++
+		if l > MaxAddrLen || off+l > len(p) {
+			return nil, fmt.Errorf("truncated address")
+		}
+		out = append(out, string(p[off:off+l]))
+		off += l
+	}
+	return out, nil
 }
 
 func encodeGetBlocks(from uint64, count uint32) []byte {

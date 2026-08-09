@@ -339,6 +339,7 @@ func (s *appState) showUnlock() {
 func (s *appState) startNodeAndDashboard() {
 	if s.node == nil {
 		s.node = p2p.New(s.chain, func(string, ...any) {})
+		s.node.SetPeerStore(filepath.Join(dataDir(), "peers.txt"))
 		_ = s.node.Start("", readSeeds()) // outbound only: no inbound port, minimal attack surface
 		s.setIntensity(loadConfig().Intensity)
 	}
