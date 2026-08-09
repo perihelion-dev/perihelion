@@ -20,12 +20,12 @@ import (
 var ErrOrphan = errors.New("orphan block: parent unknown")
 
 var (
-	bBlocks  = []byte("blocks")
-	bHeight  = []byte("height")
-	bIndex   = []byte("index")
-	bUndo    = []byte("undo")
-	bUTXO    = []byte("utxo")
-	bMeta    = []byte("meta")
+	bBlocks      = []byte("blocks")
+	bHeight      = []byte("height")
+	bIndex       = []byte("index")
+	bUndo        = []byte("undo")
+	bUTXO        = []byte("utxo")
+	bMeta        = []byte("meta")
 	bMempool     = []byte("mempool")
 	bMempoolMeta = []byte("mempoolmeta")  // txid -> fee, size, arrival
 	bMempoolSpnt = []byte("mempoolspent") // outpoint -> txid holding it
@@ -165,6 +165,10 @@ func parseUndo(b []byte) (*undoRec, error) {
 type Chain struct {
 	db    *bolt.DB
 	epoch atomic.Uint64 // bumped whenever the active tip changes
+
+	reorgCount atomic.Uint64
+	lastReorg  atomic.Uint64
+	onReorg    atomic.Pointer[func(depth, newHeight uint64)]
 }
 
 func Open(path string) (*Chain, error) {
@@ -287,6 +291,19 @@ func (c *Chain) Close() error { return c.db.Close() }
 // TipEpoch increments every time the active tip changes; miners use it to
 // abandon stale work immediately.
 func (c *Chain) TipEpoch() uint64 { return c.epoch.Load() }
+
+// ChainID identifies this chain, and is what transaction signatures commit to
+// so that a signature made here is meaningless elsewhere.
+//
+// It is derived from the genesis message alone, deliberately not from the
+// genesis block hash: the hash also depends on the initial difficulty target,
+// and difficulty parameters are mutable variables. Binding the chain's
+// identity to anything mutable would mean a stray change silently invalidated
+// every signature ever made. The message is a constant and is already what
+// declares the chain's identity.
+func ChainID() [32]byte {
+	return H([]byte("PER:chainid"), []byte(GenesisMessage))
+}
 
 // GenesisBlock is the hardcoded block 0. It carries no transactions and no
 // reward — the fair-launch anchor of the timeline. Its merkle root commits to
@@ -418,7 +435,7 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 			return [32]byte{}, false
 		}
 		return u.Addr, true
-	}); err != nil {
+	}, height); err != nil {
 		return 0, err
 	}
 	return inSum - outSum, nil
@@ -771,6 +788,7 @@ func (c *Chain) AcceptBlock(b *Block) error {
 	}
 	bh := b.Header.Hash()
 	var tipChanged bool
+	var reorgDepth uint64
 	err := c.db.Update(func(dbtx *bolt.Tx) error {
 		if readIdx(dbtx, bh[:]) != nil {
 			return nil // duplicate
@@ -804,8 +822,19 @@ func (c *Chain) AcceptBlock(b *Block) error {
 		}
 		tipWork := new(big.Int).SetBytes(meta.Get(kTipWork))
 		if work.Cmp(tipWork) > 0 {
+			// Depth is how much confirmed history is about to be discarded.
+			// It must be measured before the switch, because afterwards the
+			// new branch *is* the active chain and the fork point vanishes.
+			// A deep reorganisation is not invalid — fork choice is working as
+			// designed — but on a chain with little hashrate it is also what a
+			// double-spend looks like, so it must never pass unnoticed.
+			before := getU64(meta, kTipHeight)
+			fork := forkHeight(dbtx, b)
 			if err := reorgTo(dbtx, b); err != nil {
 				return err
+			}
+			if before > fork {
+				reorgDepth = before - fork
 			}
 			tipChanged = true
 		}
@@ -813,8 +842,46 @@ func (c *Chain) AcceptBlock(b *Block) error {
 	})
 	if err == nil && tipChanged {
 		c.epoch.Add(1)
+		if reorgDepth > 0 {
+			c.lastReorg.Store(reorgDepth)
+			c.reorgCount.Add(1)
+			if h := c.onReorg.Load(); h != nil {
+				(*h)(reorgDepth, b.Header.Height)
+			}
+		}
 	}
 	return err
+}
+
+// forkHeight returns the height at which b's branch last agreed with the
+// chain that was active before it was connected.
+func forkHeight(dbtx *bolt.Tx, b *Block) uint64 {
+	heights := dbtx.Bucket(bHeight)
+	cur := b.Header.PrevHash
+	for {
+		e := readIdx(dbtx, cur[:])
+		if e == nil {
+			return 0
+		}
+		if bytes.Equal(heights.Get(be64(e.Height)), cur[:]) {
+			return e.Height
+		}
+		hdr, err := readHeaderByHash(dbtx, cur[:])
+		if err != nil || hdr.Height == 0 {
+			return 0
+		}
+		cur = hdr.PrevHash
+	}
+}
+
+// OnReorg registers a callback invoked whenever confirmed history is
+// discarded, with the depth and the new tip height.
+func (c *Chain) OnReorg(f func(depth, newHeight uint64)) { c.onReorg.Store(&f) }
+
+// ReorgStats reports how much history has been rewritten since this node
+// started: the number of reorganisations and the deepest recent one.
+func (c *Chain) ReorgStats() (count, lastDepth uint64) {
+	return c.reorgCount.Load(), c.lastReorg.Load()
 }
 
 // AddBlock is a compatibility alias for AcceptBlock.

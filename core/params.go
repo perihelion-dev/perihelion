@@ -49,6 +49,18 @@ const (
 	MaxFutureDrift int64 = 120
 )
 
+// SighashChainIDHeight is the height from which transaction signatures must
+// commit to the chain's identity (see Tx.SigDigestV2). Until then both the
+// original and the chain-bound digest are accepted, so nodes and wallets can
+// be upgraded gradually rather than in lockstep; from this height only the
+// chain-bound form is valid.
+//
+// The date is chosen far enough ahead that anyone running a node has time to
+// update, and the change is safe to make at all only because the chain has
+// carried no transaction yet — every output so far is a coinbase, which has
+// no signature to invalidate.
+const SighashChainIDHeight uint64 = 60_000
+
 // GenesisMessage is committed to by the genesis block's merkle root. It fixes
 // the chain's identity: any chain built on a different message is a different
 // currency and can never merge with this one.

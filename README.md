@@ -265,6 +265,22 @@ rules that applied equally to everyone.
 - [ ] Reproducible builds, so independently compiled binaries can be compared
 - [ ] Independent security audit
 
+## Scheduled change: signatures bind to the chain from height 60,000
+
+From block 60,000 a transaction signature must commit to the chain's identity,
+so that a signature made here cannot be replayed on any chain that forks from
+this history. Until then both the original and the chain-bound form are
+accepted, so nodes and wallets can be updated at their own pace rather than in
+lockstep.
+
+**Operators must update before height 60,000.** A node still running older
+software will reject transactions after that point and follow a different
+chain. Mining is unaffected either way — coinbases carry no signature.
+
+The change is safe to make only because it is being made early: every output
+on this chain so far is a coinbase, so there is no existing signature to
+invalidate.
+
 ## Governance
 
 Perihelion has no owner. Consensus rules change only through on-chain miner

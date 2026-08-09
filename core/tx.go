@@ -55,8 +55,33 @@ func (t *Tx) serializeCore() []byte {
 	return w.b
 }
 
-func (t *Tx) ID() [32]byte        { return H([]byte("PER:txid"), t.serializeCore()) }
+func (t *Tx) ID() [32]byte { return H([]byte("PER:txid"), t.serializeCore()) }
+
+// SigDigest is the original signing digest, which commits to the transaction
+// but not to the chain it belongs to. Retained because it is what every
+// signature made before SighashChainIDHeight used.
 func (t *Tx) SigDigest() [32]byte { return H([]byte("PER:sig"), t.serializeCore()) }
+
+// SigDigestV2 additionally commits to the chain's identity, so a signature
+// made for this chain is meaningless on any other. Without it, a future fork
+// sharing this history would let a payment made on one chain be replayed on
+// the other against the signer's wishes — the failure that split Ethereum and
+// Ethereum Classic. It costs nothing to fix before the first transaction
+// exists and cannot be fixed cheaply afterwards.
+func (t *Tx) SigDigestV2() [32]byte {
+	id := ChainID()
+	return H([]byte("PER:sig2"), id[:], t.serializeCore())
+}
+
+// SigDigestAt returns the digest a transaction must be signed with at a given
+// height. Both forms are accepted before the switch so that software can be
+// upgraded gradually; afterwards only the chain-bound form is valid.
+func (t *Tx) SigDigestAt(height uint64) [32]byte {
+	if height >= SighashChainIDHeight {
+		return t.SigDigestV2()
+	}
+	return t.SigDigest()
+}
 
 func (t *Tx) Serialize() []byte {
 	w := &buf{}
@@ -112,9 +137,14 @@ func DeserializeTx(b []byte) (*Tx, error) {
 func AddrOfPubKey(pub []byte) [32]byte { return H([]byte("PER:addr"), pub) }
 
 // VerifySignatures checks that every input's public key matches the address of
-// the output it spends and carries a valid ML-DSA-65 signature over the tx digest.
-func (t *Tx) VerifySignatures(addrOf func(OutPoint) ([32]byte, bool)) error {
-	digest := t.SigDigest()
+// the output it spends and carries a valid ML-DSA-65 signature over the tx
+// digest for the given height. Below SighashChainIDHeight either digest is
+// accepted; at or above it, only the chain-bound one.
+func (t *Tx) VerifySignatures(addrOf func(OutPoint) ([32]byte, bool), height uint64) error {
+	digests := [][32]byte{t.SigDigestV2()}
+	if height < SighashChainIDHeight {
+		digests = append(digests, t.SigDigest())
+	}
 	for i := range t.Inputs {
 		in := &t.Inputs[i]
 		want, ok := addrOf(in.Prev)
@@ -128,7 +158,14 @@ func (t *Tx) VerifySignatures(addrOf func(OutPoint) ([32]byte, bool)) error {
 		if err != nil {
 			return fmt.Errorf("input %d: bad public key: %w", i, err)
 		}
-		if !SigScheme.Verify(pub, digest[:], in.Signature, nil) {
+		valid := false
+		for _, d := range digests {
+			if SigScheme.Verify(pub, d[:], in.Signature, nil) {
+				valid = true
+				break
+			}
+		}
+		if !valid {
 			return fmt.Errorf("input %d: invalid signature", i)
 		}
 	}

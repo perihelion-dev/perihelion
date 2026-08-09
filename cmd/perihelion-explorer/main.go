@@ -280,21 +280,32 @@ func (e *explorer) apiStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"height":       st.Height,
-		"tip":          hex.EncodeToString(st.TipHash[:]),
-		"tip_time":     time.Unix(st.TipTime, 0).UTC().Format(time.RFC3339),
-		"circulating":  core.FormatAmount(st.Emitted - st.Burned),
-		"emitted":      core.FormatAmount(st.Emitted),
-		"burned":       core.FormatAmount(st.Burned),
-		"supply_bound": core.FormatAmount(core.MaxSupply),
-		"reward_pool":  core.FormatAmount(st.Pool),
-		"next_subsidy": core.FormatAmount(st.NextSubsidy),
-		"difficulty":   st.Difficulty.String(),
-		"mempool":      st.Mempool,
-		"peers":        e.node.PeerCount(),
-		"synced":       e.node.Synced(),
+		"height":           st.Height,
+		"tip":              hex.EncodeToString(st.TipHash[:]),
+		"tip_time":         time.Unix(st.TipTime, 0).UTC().Format(time.RFC3339),
+		"circulating":      core.FormatAmount(st.Emitted - st.Burned),
+		"emitted":          core.FormatAmount(st.Emitted),
+		"burned":           core.FormatAmount(st.Burned),
+		"supply_bound":     core.FormatAmount(core.MaxSupply),
+		"reward_pool":      core.FormatAmount(st.Pool),
+		"next_subsidy":     core.FormatAmount(st.NextSubsidy),
+		"difficulty":       st.Difficulty.String(),
+		"mempool":          st.Mempool,
+		"peers":            e.node.PeerCount(),
+		"synced":           e.node.Synced(),
+		"chain_id":         hex.EncodeToString(chainIDBytes()),
+		"reorgs_seen":      reorgCount(e.chain),
+		"last_reorg_depth": lastReorgDepth(e.chain),
 	})
 }
+
+func chainIDBytes() []byte {
+	id := core.ChainID()
+	return id[:]
+}
+
+func reorgCount(c *core.Chain) uint64     { n, _ := c.ReorgStats(); return n }
+func lastReorgDepth(c *core.Chain) uint64 { _, d := c.ReorgStats(); return d }
 
 func (e *explorer) apiBlock(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/block/")

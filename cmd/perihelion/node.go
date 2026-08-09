@@ -83,6 +83,18 @@ func cmdNode(args []string) error {
 		fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
 	}
 
+	// A deep reorganisation on a low-hashrate chain is what a double-spend
+	// looks like from the outside, so it is reported prominently rather than
+	// buried. Nodes do not refuse deep reorgs: a hard depth limit would turn
+	// any prolonged network split into a permanent one.
+	c.OnReorg(func(depth, newHeight uint64) {
+		if depth >= 6 {
+			logf("WARNING: chain reorganised %d blocks (now at %d). Payments confirmed in the discarded blocks are no longer confirmed; treat recent history with caution.", depth, newHeight)
+		} else {
+			logf("chain reorganised %d block(s), now at %d", depth, newHeight)
+		}
+	})
+
 	node := p2p.New(c, logf)
 	node.SetPeerStore(filepath.Join(*datadir, "peers.txt"))
 	if *advertise != "" {
