@@ -151,6 +151,7 @@ func (e *explorer) routes() http.Handler {
 	mux.HandleFunc("/search", e.handleSearch)
 	mux.HandleFunc("/api", e.apiIndex)
 	mux.HandleFunc("/api/status", e.apiStatus)
+	mux.HandleFunc("/api/miners", e.apiMiners)
 	mux.HandleFunc("/api/block/", e.apiBlock)
 	mux.HandleFunc("/api/tx/", e.apiTx)
 	mux.HandleFunc("/api/address/", e.apiAddress)
@@ -306,6 +307,93 @@ func chainIDBytes() []byte {
 
 func reorgCount(c *core.Chain) uint64     { n, _ := c.ReorgStats(); return n }
 func lastReorgDepth(c *core.Chain) uint64 { _, d := c.ReorgStats(); return d }
+
+// apiMiners reports who mined a range of blocks, attributed by the address
+// each coinbase paid. Published because the concentration of block production
+// is the number that decides whether a chain can be trusted, and a project
+// that hides it is asking to be taken on faith. It is served here so that
+// anyone — including the operator of a mining machine — can check it without
+// stopping their own node to read its database.
+func (e *explorer) apiMiners(w http.ResponseWriter, r *http.Request) {
+	st, err := e.chain.Stats()
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "chain unavailable")
+		return
+	}
+	const maxWindow = 2000
+	window := uint64(100)
+	if s := r.URL.Query().Get("blocks"); s != "" {
+		n, err := strconv.ParseUint(s, 10, 64)
+		if err != nil || n == 0 || n > maxWindow {
+			apiError(w, http.StatusBadRequest, fmt.Sprintf("blocks must be between 1 and %d", maxWindow))
+			return
+		}
+		window = n
+	}
+	from := uint64(1)
+	if st.Height > window {
+		from = st.Height - window + 1
+	}
+
+	counts := map[[32]byte]uint64{}
+	rewards := map[[32]byte]uint64{}
+	var total uint64
+	for h := from; h <= st.Height; h++ {
+		b, err := e.chain.BlockByHeight(h)
+		if err != nil {
+			break
+		}
+		if len(b.Txs) == 0 || len(b.Txs[0].Outputs) == 0 {
+			continue
+		}
+		cb := b.Txs[0]
+		var paid uint64
+		for i := range cb.Outputs {
+			paid += cb.Outputs[i].Value
+		}
+		addr := cb.Outputs[0].Addr
+		counts[addr]++
+		rewards[addr] += paid
+		total++
+	}
+	if total == 0 {
+		apiError(w, http.StatusNotFound, "no blocks in range")
+		return
+	}
+
+	type entry struct {
+		Address string  `json:"address"`
+		Blocks  uint64  `json:"blocks"`
+		Share   float64 `json:"share_percent"`
+		Reward  string  `json:"rewarded"`
+	}
+	list := make([]entry, 0, len(counts))
+	for a, n := range counts {
+		list = append(list, entry{
+			Address: core.EncodeAddress(a),
+			Blocks:  n,
+			Share:   float64(n) * 100 / float64(total),
+			Reward:  core.FormatAmount(rewards[a]),
+		})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Blocks > list[j].Blocks })
+
+	top := 0.0
+	if len(list) > 0 {
+		top = list[0].Share
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"from_height":     from,
+		"to_height":       st.Height,
+		"blocks_examined": total,
+		"distinct_miners": len(list),
+		"largest_share":   top,
+		// A single party above half the blocks can rewrite recent history.
+		// Saying so plainly is more useful than leaving it to be inferred.
+		"majority_held_by_one": top > 50,
+		"miners":               list,
+	})
+}
 
 func (e *explorer) apiBlock(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/block/")
