@@ -1,115 +1,226 @@
-# Perihelion (PER)
+<div align="center">
 
-**Post-quantum. CPU-mineable. Deflationary. Fair launch.**
+# Perihelion
 
-Perihelion is a proof-of-work cryptocurrency designed for the decades ahead,
-not the decade behind:
+**A post-quantum, CPU-mineable, deflationary proof-of-work cryptocurrency.**
+
+Mainnet genesis: 2026-08-09 00:00:00 UTC · No premine · MIT licensed
+
+</div>
+
+---
+
+Perihelion is a from-scratch cryptocurrency built for the next thirty years
+rather than the last fifteen. Its signatures are quantum-resistant from block
+one, its proof-of-work is designed so ordinary computers stay competitive, and
+its monetary policy is deflationary while still paying miners indefinitely.
+
+The consensus implementation is roughly 3,000 lines of Go. That is deliberate:
+a monetary system should be small enough that a competent reader can audit it
+in an afternoon.
+
+## Design
 
 | | Bitcoin | Perihelion |
 |---|---|---|
-| Signatures | ECDSA (breakable by a large quantum computer) | **ML-DSA-65** (FIPS 204, lattice-based, NIST category 3) |
+| Signatures | ECDSA (secp256k1) | **ML-DSA-65** — FIPS 204, NIST security category 3 |
 | Hashing | SHA-256 | **SHA3-256** |
-| Mining | ASIC farms | **Argon2id, memory-hard — every PC can mine** |
-| Block time | 10 minutes | **60 seconds** |
-| Difficulty | every 2016 blocks | **every block (LWMA)** — stable even when solar-powered miners come and go with the sun |
-| Supply | fixed 21M, miner income decays to fees | **< 30M hard bound + fee burn = shrinking supply**, miners paid forever from a smoothed reward pool |
-| Launch | fair | **fair — no premine, no dev fund, genesis pays nobody** |
+| Proof-of-work | SHA-256d (ASIC-dominated) | **Argon2id**, 64 MiB per attempt (memory-hard) |
+| Block interval | 10 minutes | **60 seconds** |
+| Difficulty adjustment | every 2,016 blocks | **every block** (LWMA) |
+| Supply | 21,000,000 fixed | **< 30,000,000** plus continuous fee burn |
+| Long-run miner revenue | transaction fees only | **fee burn + smoothed reward pool** |
 
-## Monetary design: circular deflationary emission
+### Post-quantum cryptography
 
-1. **Smooth emission, hard bound.** The block subsidy starts at 10 PER and
-   decays by the fixed factor 2999999/3000000 per block — a halving every
-   ~3.95 years with no halving shocks. Total emission is provably below
-   30,000,000 PER. The exact integer formula lives in `core/emission.go`;
-   anyone can recompute the entire supply curve.
-2. **Fee burn.** Half of every transaction fee is destroyed forever. Real
-   usage makes PER scarcer — genuinely deflationary, unlike a fixed cap.
-3. **Miner reward pool.** The other half flows into an on-chain pool that pays
-   out 1/14,400 of its balance to each block's miner (a ~10-day smoothing
-   window). Miner income never falls off a cliff and grows with network usage.
+Every signature in Perihelion is ML-DSA-65 (Dilithium), standardised by NIST
+in FIPS 204 and believed secure against both classical and quantum
+adversaries. There is no elliptic-curve fallback anywhere in the protocol, so
+there is no migration to perform later and no legacy path for an attacker to
+target. Addresses are SHA3-256 commitments to the public key.
 
-## Mainnet
+The trade-off is size: an ML-DSA-65 signature is approximately 3.3 KB versus
+71 bytes for ECDSA. Perihelion accepts larger transactions in exchange for
+long-term security.
 
-Genesis: **2026-08-09 00:00:00 UTC**. No premine, no founder allocation, no
-token sale — the genesis block pays nobody. Every PER in existence was mined
-after that instant by whoever was running a node.
+### Egalitarian mining
 
-The genesis block commits to this message:
+The proof-of-work function is Argon2id with a 64 MiB memory cost per attempt.
+Memory bandwidth, not raw arithmetic throughput, is the bottleneck — the
+property that makes purpose-built hardware far less advantageous than it is
+for SHA-256. A laptop, a desktop, or a small solar-powered machine can mine
+Perihelion on equal footing.
 
-> Perihelion genesis 2026-08-09 — quantum-safe money, mined by everyone, owned by no one
+Difficulty retargets on **every block** using LWMA (linearly weighted moving
+average). This matters for a network whose participants power up and down with
+daily cycles: Bitcoin's two-week adjustment window responds poorly to abrupt
+hashrate changes, while Perihelion tracks them continuously.
 
-## Quick start
+### Monetary policy
 
-```
+Perihelion combines three mechanisms that are individually proven but rarely
+combined:
+
+**1 — Smooth emission under a hard bound.** The block subsidy begins at 10 PER
+and decays by a fixed factor of 2999999/3000000 per block, halving roughly
+every 3.95 years. Unlike a step-function halving, there is no overnight
+revenue shock to the mining industry. Total emission is provably bounded below
+**30,000,000 PER**. The schedule is pure integer arithmetic (`core/emission.go`)
+and is identical on every platform.
+
+| Year | Block subsidy | Circulating supply | % of bound |
+|---:|---:|---:|---:|
+| 1 | 8.39 PER | 4,824,348 | 16.1% |
+| 4 | 4.96 PER | 15,121,499 | 50.4% |
+| 8 | 2.46 PER | 22,621,007 | 75.4% |
+| 20 | 0.30 PER | 29,099,858 | 97.0% |
+| 40 | 0.009 PER | 29,972,992 | 99.9% |
+
+**2 — Fee burn.** Half of every transaction fee is destroyed permanently.
+Circulating supply therefore contracts with real economic activity — a
+stronger property than a fixed cap, which merely stops growing.
+
+**3 — Smoothed reward pool.** The other half of each fee enters an on-chain
+pool that pays out 1/14,400 of its balance to each block's miner, a roughly
+ten-day smoothing window. Miner revenue never falls off a cliff when the
+subsidy fades, it scales with network usage, and the smoothing removes the
+fee-sniping incentive that destabilises fee-only chains.
+
+## Installation
+
+Requires Go 1.26 or later.
+
+```bash
+git clone https://github.com/perihelion-dev/perihelion.git
+cd perihelion
 go build ./cmd/perihelion
-./perihelion wallet new               # password + 24-word recovery phrase
-./perihelion node --mine              # join the network and mine
+```
+
+## Usage
+
+Create a wallet. You will be asked for a password and shown a 24-word recovery
+phrase — write it down offline.
+
+```bash
+./perihelion wallet new
+```
+
+Join the network and mine:
+
+```bash
+./perihelion node --mine
+```
+
+Check your balance and send coins:
+
+```bash
 ./perihelion balance
 ./perihelion send --to per1... --amount 1.5
+```
+
+Inspect the chain:
+
+```bash
 ./perihelion info
+./perihelion block 1000
 ```
 
-A fresh node bootstraps from the public seed automatically. To use your own
-peers instead, list them in `~/.perihelion/seeds.txt` (one `host:port` per
-line) or pass `--connect host:port`. Run your own seed with
-`--listen :16180` on an open port — the network needs no permission to grow.
+All commands accept `--datadir` (default `~/.perihelion`). Run
+`./perihelion help` for the full command list.
 
-One binary, no configuration. Mining uses your CPU cores with Argon2id
-(64 MiB per attempt) — the same hardware budget for everyone.
+### Desktop wallet
 
-There is also a **desktop wallet** (`cmd/perihelion-app`) for macOS, Windows
-and Linux with an embedded node and miner: create or restore a wallet, watch
-blocks arrive, send PER — no terminal required.
+`cmd/perihelion-app` is a graphical wallet for macOS, Windows and Linux with an
+embedded node and miner — wallet creation and recovery, live balance and block
+view, and sending, without a terminal.
 
-## Local RPC (the machine interface)
-
-The node serves an authenticated JSON API on `127.0.0.1:16181` — loopback
-only, protected by a token in `~/.perihelion/rpc-token`. This is how scripts
-and AI agents hold PER and pay with it:
-
+```bash
+go build ./cmd/perihelion-app
 ```
+
+## Running a node
+
+A node with no configuration bootstraps from the built-in seed. To choose your
+own peers, list them in `~/.perihelion/seeds.txt` (one `host:port` per line) or
+pass `--connect host:port`. `--connect none` disables outbound connections
+entirely.
+
+To operate a public seed node, accept inbound connections on the default port:
+
+```bash
+./perihelion node --listen :16180
+```
+
+The network requires no permission to grow. Anyone may run a seed, and nodes
+depend on seeds only until they have peers of their own.
+
+### Local RPC
+
+When a node is running, it serves an authenticated JSON API on
+`127.0.0.1:16181`. The token lives in `~/.perihelion/rpc-token`.
+
+```bash
 curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" http://127.0.0.1:16181/status
 curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" http://127.0.0.1:16181/balance
 curl -H "X-Auth: $(cat ~/.perihelion/rpc-token)" -X POST \
      -d '{"to":"per1...","amount":"1.5"}' http://127.0.0.1:16181/send
 ```
 
-## Security posture
+This is the integration surface for scripts, services and autonomous agents.
 
-- **No telemetry, no phone-home.** The node only ever talks to peers you
-  explicitly configure. `core` and `wallet` contain zero networking code.
-- **Peers are untrusted.** Every message is size-capped, every received block
-  and transaction is fully re-validated by consensus before it touches state.
-- **Keys never leave your machine.** The wallet is a local file (mode 0600);
-  the RPC binds to loopback and requires the local auth token.
-- **Memory-safe implementation** (Go), no `unsafe`, dependencies pinned by
-  hash in `go.sum`, `govulncheck` clean.
+## Security
 
-## Status
+**Key custody.** Wallet files are encrypted at rest with AES-256-GCM under a
+key derived by Argon2id (64 MiB, t=3). The public key is stored in clear so
+that addresses and balances remain readable while locked; signing requires the
+password. A wallet is fully recoverable from its 24-word phrase alone.
 
-**Early and experimental.** The chain validates fully, mines, syncs, reorgs
-and sends — covered by end-to-end, adversarial and multi-node network tests.
-But it is young, it has not been audited, and its hashrate is small: a new
-chain is cheap to attack until enough independent miners join. Do not store
-value you cannot afford to lose, and do not treat PER as an investment.
+**Network.** Peers are treated as hostile. Every frame is length-bounded, and
+every block and transaction is independently revalidated by the consensus layer
+before it can affect state. A node connects only to peers its operator
+configured; there is no discovery protocol, no telemetry, and no phone-home.
+The `core` and `wallet` packages contain no networking code whatsoever.
 
-Roadmap:
-- [x] P2P networking: gossip, sync, fork choice (heaviest chain), reorgs
-- [x] Local JSON-RPC API (wallet + status)
-- [x] Encrypted wallets (Argon2id + AES-256-GCM) with 24-word recovery phrases
+**Implementation.** Written in Go — memory-safe, no `unsafe`. Dependencies are
+pinned by hash and limited to Cloudflare CIRCL (ML-DSA), `golang.org/x/crypto`
+(Argon2id) and bbolt (storage). `govulncheck` reports no known vulnerabilities.
+
+**What is not yet true.** The code has not received an independent security
+audit. The network is young, and a chain with modest hashrate is inexpensive to
+attack until enough independent miners participate. Treat Perihelion as
+experimental software, not as a store of value.
+
+## Genesis
+
+The genesis block contains no transactions and pays no reward. Its merkle root
+commits to the following message, which fixes the chain's identity — a chain
+built on any other message is a different currency and can never merge with
+this one:
+
+> Perihelion genesis 2026-08-09 — quantum-safe money, mined by everyone, owned by no one
+
+There was no premine, no founder allocation, no presale and no token sale.
+Every unit of PER in existence was mined after 2026-08-09 00:00:00 UTC under
+rules that applied equally to everyone.
+
+## Roadmap
+
+- [x] Consensus core, UTXO model, post-quantum signatures
+- [x] P2P gossip, initial sync, fork choice with atomic reorganisation
+- [x] Encrypted wallets with 24-word recovery phrases
 - [x] Desktop wallet with embedded node and miner
 - [x] Mainnet genesis
-- [ ] More independent seed nodes (run one!)
+- [ ] Additional independent seed nodes
 - [ ] Block explorer
-- [ ] Independent security review
 - [ ] Reproducible builds and signed releases
+- [ ] Independent security audit
 
 ## Contributing
 
-Run a node. Mine. Read the consensus code in `core/` — it is deliberately
-small enough to audit in an afternoon. Report anything that looks wrong.
-There is no company here and no token to buy; the code is the whole story.
+Run a node. Mine. Read `core/` and report anything that looks wrong — issues
+and pull requests are welcome. There is no company behind Perihelion, no
+treasury, and nothing to buy. The code is the entire proposition.
 
 ## License
 
-MIT. No premine, no token sale, no company. The code is the whole story.
+MIT. See [LICENSE](LICENSE).
