@@ -1,0 +1,46 @@
+# Running a Perihelion node in a container, isolated from anything else on the
+# host. Adjust MINE_TO, then:  docker compose up -d --build
+#
+# By default this node makes only outbound connections: it mines and relays but
+# publishes no address and accepts no inbound traffic. To run a public node
+# that others can discover and connect to, uncomment the ports section and add
+# --listen :16180 --advertise <your.public.ip>:16180 to the command.
+
+services:
+  perihelion:
+    build: .
+    container_name: perihelion-node
+    restart: unless-stopped
+    command:
+      - node
+      - --datadir=/data
+      - --rpc=off
+      - --listen=off
+      - --threads=2
+      - --mine
+      - --mineto=${MINE_TO:?set MINE_TO to your per1... address}
+    volumes:
+      - perihelion-data:/data
+    # ports:
+    #   - "16180:16180"
+
+    # Nothing inside needs to write outside its data volume or gain privileges.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Leave headroom for whatever else the host runs.
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  perihelion-data:
