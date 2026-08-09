@@ -3,6 +3,8 @@
 /perihelion
 /perihelion-app
 /perihelion-linux
+/perihelion-explorer
+/perihelion-explorer-linux
 
 # macOS application bundle produced from cmd/perihelion-app
 /Perihelion.app/

@@ -10,6 +10,16 @@ var MinDifficulty = big.NewInt(16)
 
 func InitialTarget() *big.Int { return new(big.Int).Div(MaxTarget, MinDifficulty) }
 
+// DifficultyOf converts a block's target into the expected number of hash
+// attempts required to find it.
+func DifficultyOf(target [32]byte) *big.Int {
+	t := new(big.Int).SetBytes(target[:])
+	if t.Sign() == 0 {
+		return new(big.Int)
+	}
+	return new(big.Int).Div(MaxTarget, t)
+}
+
 // NextTarget returns the required PoW target for the child of the last header
 // in headers (a consecutive chain segment, oldest first). Difficulty is fixed
 // while the LWMA window fills, then follows LWMA-1 (zawy12): a linearly

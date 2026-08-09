@@ -9,12 +9,10 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/cloudflare/circl/sign"
 	"golang.org/x/crypto/argon2"
@@ -414,29 +412,10 @@ func unb64(s string) ([]byte, error) {
 
 // --- addresses & sending ---
 
-// EncodeAddress renders an address as "per1" + 64 hex chars + 8 checksum chars.
-func EncodeAddress(a [32]byte) string {
-	chk := core.H([]byte("PER:chk"), a[:])
-	return "per1" + hex.EncodeToString(a[:]) + hex.EncodeToString(chk[:4])
-}
-
-func DecodeAddress(s string) ([32]byte, error) {
-	var a [32]byte
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "per1") || len(s) != 4+64+8 {
-		return a, fmt.Errorf("invalid address format")
-	}
-	payload, err := hex.DecodeString(s[4 : 4+64])
-	if err != nil {
-		return a, fmt.Errorf("invalid address encoding")
-	}
-	copy(a[:], payload)
-	chk := core.H([]byte("PER:chk"), a[:])
-	if s[4+64:] != hex.EncodeToString(chk[:4]) {
-		return a, fmt.Errorf("address checksum mismatch — please re-check for typos")
-	}
-	return a, nil
-}
+// EncodeAddress and DecodeAddress are defined in core, where the address
+// format belongs; they are re-exported here so existing callers keep working.
+func EncodeAddress(a [32]byte) string         { return core.EncodeAddress(a) }
+func DecodeAddress(s string) ([32]byte, error) { return core.DecodeAddress(s) }
 
 // BuildSend creates and signs a transaction sending amount (in peri) to `to`,
 // paying fee, with change returned to the wallet's own address.
