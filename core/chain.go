@@ -371,8 +371,18 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 	}
 	utxos := dbtx.Bucket(bUTXO)
 	var inSum, outSum uint64
+	// A transaction must not list the same output twice. Without this the
+	// value of a single unspent output would be counted once per mention,
+	// letting anyone holding one coin claim several — coins created from
+	// nothing, with no hashpower required. The caller's `spent` map guards
+	// against conflicts with *other* transactions and cannot cover this.
+	seen := make(map[OutPoint]struct{}, len(t.Inputs))
 	for i := range t.Inputs {
 		op := t.Inputs[i].Prev
+		if _, dup := seen[op]; dup {
+			return 0, fmt.Errorf("input %d: output already spent by input of the same transaction", i)
+		}
+		seen[op] = struct{}{}
 		if spent[op] {
 			return 0, fmt.Errorf("input %d: double spend", i)
 		}
@@ -1074,6 +1084,49 @@ func (c *Chain) TxByID(id [32]byte) (*Tx, uint64, error) {
 		return nil, 0, err
 	}
 	return tx, height, nil
+}
+
+// SupplyAudit is the arithmetic that must hold if no coin was ever created
+// outside the rules.
+type SupplyAudit struct {
+	Emitted    uint64 // total block subsidies ever paid
+	Burned     uint64 // fees destroyed
+	Pool       uint64 // fees credited but not yet paid out
+	UTXOTotal  uint64 // value actually present in unspent outputs
+	Expected   uint64 // Emitted − Burned − Pool
+	Outputs    int
+	Consistent bool
+}
+
+// AuditSupply totals the unspent output set and compares it with the supply
+// the chain claims to have issued. Every coin that exists must be either an
+// unspent output or still sitting in the reward pool; anything else means
+// value was created outside consensus. This is the check that reveals an
+// inflation bug after the fact, so it is worth running on any node whose
+// history predates a consensus fix.
+func (c *Chain) AuditSupply() (*SupplyAudit, error) {
+	a := &SupplyAudit{}
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		meta := dbtx.Bucket(bMeta)
+		a.Emitted = getU64(meta, kEmitted)
+		a.Burned = getU64(meta, kBurned)
+		a.Pool = getU64(meta, kPool)
+		return dbtx.Bucket(bUTXO).ForEach(func(k, v []byte) error {
+			u, err := deserializeUTXO(v)
+			if err != nil {
+				return err
+			}
+			a.UTXOTotal += u.Value
+			a.Outputs++
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	a.Expected = a.Emitted - a.Burned - a.Pool
+	a.Consistent = a.UTXOTotal == a.Expected
+	return a, nil
 }
 
 // TipInfo returns the active tip's height and hash.

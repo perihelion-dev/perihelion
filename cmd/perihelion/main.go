@@ -112,6 +112,8 @@ func main() {
 		err = cmdGovernance(os.Args[2:])
 	case "miners":
 		err = cmdMiners(os.Args[2:])
+	case "audit":
+		err = cmdAudit(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -142,6 +144,7 @@ Usage:
   perihelion block HEIGHT                      inspect a block
   perihelion governance                        list proposed rule changes and their network status
   perihelion miners [--from N] [--to N]        who actually mined the blocks, by reward address
+  perihelion audit                             verify that no coin exists outside the rules
 
 All commands accept --datadir DIR (default ~/.perihelion).
 `)
@@ -276,6 +279,48 @@ func cmdMiners(args []string) error {
 		fmt.Println("can reorganise recent blocks. Treat confirmations here with caution.")
 	}
 	return nil
+}
+
+// cmdAudit checks that the coins the chain claims to have issued are exactly
+// the coins that exist. Every emitted coin must be either an unspent output or
+// still waiting in the reward pool; burned coins must be absent from both. A
+// mismatch means value was created outside consensus.
+func cmdAudit(args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	datadir := fs.String("datadir", defaultDataDir(), "data directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := openChain(*datadir)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	a, err := c.AuditSupply()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Emitted as block rewards   %18s PER\n", core.FormatAmount(a.Emitted))
+	fmt.Printf("Destroyed by fee burn      %18s PER\n", core.FormatAmount(a.Burned))
+	fmt.Printf("Held in the reward pool    %18s PER\n", core.FormatAmount(a.Pool))
+	fmt.Printf("Therefore expected to exist%18s PER\n", core.FormatAmount(a.Expected))
+	fmt.Printf("Actually in unspent outputs%18s PER  (%d outputs)\n", core.FormatAmount(a.UTXOTotal), a.Outputs)
+	fmt.Println()
+	if a.Consistent {
+		fmt.Println("✓ Supply is consistent. No coin exists that consensus did not create.")
+		return nil
+	}
+	diff := int64(a.UTXOTotal) - int64(a.Expected)
+	fmt.Printf("✗ MISMATCH of %s PER — value exists that the rules did not create.\n", core.FormatAmount(uint64(abs64(diff))))
+	fmt.Println("  Do not treat this chain as sound. Report it.")
+	return fmt.Errorf("supply audit failed")
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func cmdWallet(args []string) error {

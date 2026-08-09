@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -23,6 +24,22 @@ const (
 	// dialling would start building its own branch from genesis; with it, a
 	// genuinely isolated network can still bootstrap.
 	isolationGrace = 90 * time.Second
+
+	// Misbehaviour scoring. A peer that sends material a node cannot possibly
+	// have produced honestly accumulates points; at the threshold it is
+	// disconnected and its address refused for a while. The point of the
+	// design is to charge nothing for honest mistakes: a peer racing us during
+	// a reorganisation may legitimately offer a block we reject, so ordinary
+	// rejections cost little and heal, while malformed data — which no correct
+	// implementation emits — costs a lot.
+	banThreshold  = 100
+	banDuration   = time.Hour
+	scoreHalfLife = 5 * time.Minute
+	maxBanned     = 1024
+
+	penaltyMalformed     = 25 // undecodable frame payload: never honest
+	penaltyInvalidBlock  = 10 // fails consensus, and not merely an orphan
+	penaltyUnknownParent = 0  // orphans are normal during sync; free
 )
 
 // Node gossips blocks and transactions, keeps the local chain in sync, and
@@ -56,6 +73,70 @@ type Node struct {
 	dialing     map[string]bool // discovery dials in flight
 	seedAddrs   []string
 	discoveryOn bool
+
+	banMu  sync.Mutex
+	banned map[string]time.Time // host -> banned until
+}
+
+// hostOf extracts the bare host from a "host:port" endpoint.
+func hostOf(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// isSeedHost reports whether a host is one the operator configured. Those are
+// never banned: the operator's own choice of entry point outranks any
+// automatic judgement, and banning them could isolate the node entirely.
+func (n *Node) isSeedHost(host string) bool {
+	n.advMu.Lock()
+	defer n.advMu.Unlock()
+	for _, s := range n.seedAddrs {
+		if hostOf(s) == host {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) isBanned(host string) bool {
+	n.banMu.Lock()
+	defer n.banMu.Unlock()
+	until, ok := n.banned[host]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(n.banned, host)
+		return false
+	}
+	return true
+}
+
+// penalize charges a peer for misbehaviour and disconnects it once the score
+// crosses the threshold, refusing its address for a while afterwards.
+func (n *Node) penalize(p *peer, points float64, reason string) {
+	if points <= 0 {
+		return
+	}
+	total := p.addScore(points)
+	if total < banThreshold {
+		return
+	}
+	host := hostOf(p.name)
+	if !n.isSeedHost(host) {
+		n.banMu.Lock()
+		if len(n.banned) >= maxBanned {
+			n.banned = map[string]time.Time{}
+		}
+		n.banned[host] = time.Now().Add(banDuration)
+		n.banMu.Unlock()
+		n.logf("p2p: banning %s for %s (%s)", host, banDuration, reason)
+	} else {
+		n.logf("p2p: configured seed %s is misbehaving (%s) — not banning", host, reason)
+	}
+	p.conn.Close()
 }
 
 // Synced reports whether this node has caught up with the best chain any peer
@@ -96,6 +177,25 @@ type peer struct {
 	height     uint64
 	lastReq    time.Time
 	advertised string // the address this peer listens on, if it accepts connections
+	score      float64
+	scoredAt   time.Time
+}
+
+// addScore applies time decay and adds points, returning the new total.
+func (p *peer) addScore(points float64) float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if !p.scoredAt.IsZero() && p.score > 0 {
+		elapsed := now.Sub(p.scoredAt)
+		p.score *= math.Pow(0.5, float64(elapsed)/float64(scoreHalfLife))
+		if p.score < 0.5 {
+			p.score = 0
+		}
+	}
+	p.scoredAt = now
+	p.score += points
+	return p.score
 }
 
 func (p *peer) send(t byte, payload []byte) error {
@@ -253,8 +353,8 @@ func (n *Node) discoveryDial(addr string) {
 		delete(n.dialing, addr)
 		n.advMu.Unlock()
 	}()
-	if n.advertisedAddr() == addr {
-		return // never dial ourselves
+	if n.advertisedAddr() == addr || n.isBanned(hostOf(addr)) {
+		return // never dial ourselves, nor anyone we have banned
 	}
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
@@ -307,7 +407,7 @@ func (n *Node) acceptLoop(ln net.Listener) {
 		n.mu.Lock()
 		full := len(n.peers) >= maxPeers
 		n.mu.Unlock()
-		if full {
+		if full || n.isBanned(hostOf(conn.RemoteAddr().String())) {
 			conn.Close()
 			continue
 		}
@@ -493,6 +593,7 @@ func (n *Node) dispatch(p *peer, t byte, payload []byte) error {
 	case msgAddr:
 		addrs, err := decodeAddrs(payload)
 		if err != nil {
+			n.penalize(p, penaltyMalformed, "undecodable address list")
 			return err
 		}
 		learned := 0
@@ -511,6 +612,7 @@ func (n *Node) dispatch(p *peer, t byte, payload []byte) error {
 	case msgHello:
 		_, height, _, advertised, err := decodeHello(payload)
 		if err != nil {
+			n.penalize(p, penaltyMalformed, "undecodable handshake")
 			return err
 		}
 		n.learnAddr(advertised, p)
@@ -554,6 +656,7 @@ func (n *Node) dispatch(p *peer, t byte, payload []byte) error {
 func (n *Node) handleBlock(p *peer, raw []byte) {
 	b, err := core.DeserializeBlock(raw)
 	if err != nil {
+		n.penalize(p, penaltyMalformed, "undecodable block")
 		return
 	}
 	bh := b.Header.Hash()
@@ -566,6 +669,7 @@ func (n *Node) handleBlock(p *peer, raw []byte) {
 			return
 		}
 		n.logf("p2p: rejected block %x… from %s: %v", bh[:8], p.name, err)
+		n.penalize(p, penaltyInvalidBlock, "invalid block")
 		return
 	}
 	n.logf("p2p: accepted block %d (%x…) from %s", b.Header.Height, bh[:8], p.name)
@@ -625,6 +729,7 @@ func (n *Node) connectOrphans(parent [32]byte) {
 func (n *Node) handleTx(p *peer, raw []byte) {
 	t, err := core.DeserializeTx(raw)
 	if err != nil {
+		n.penalize(p, penaltyMalformed, "undecodable transaction")
 		return
 	}
 	id := t.ID()
