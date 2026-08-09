@@ -1,9 +1,17 @@
+# Compiled binaries at the repository root (anchored with a leading slash so
+# these patterns never match source directories such as cmd/perihelion-app).
 /perihelion
+/perihelion-app
+/perihelion-linux
+
+# macOS application bundle produced from cmd/perihelion-app
+/Perihelion.app/
+
+# Generated icon artefacts
+/icon.png
+/icon.icns
+/icon.iconset/
+
+# Chain databases and OS clutter
 *.db
 .DS_Store
-perihelion-linux
-perihelion-app
-Perihelion.app/
-icon.png
-icon.icns
-icon.iconset/
