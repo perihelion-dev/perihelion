@@ -26,8 +26,10 @@ var (
 	bUndo    = []byte("undo")
 	bUTXO    = []byte("utxo")
 	bMeta    = []byte("meta")
-	bMempool = []byte("mempool")
-	bTxIndex = []byte("txindex")
+	bMempool     = []byte("mempool")
+	bMempoolMeta = []byte("mempoolmeta")  // txid -> fee, size, arrival
+	bMempoolSpnt = []byte("mempoolspent") // outpoint -> txid holding it
+	bTxIndex     = []byte("txindex")
 
 	kTip       = []byte("tip")
 	kTipHeight = []byte("tipheight")
@@ -175,7 +177,7 @@ func Open(path string) (*Chain, error) {
 	}
 	c := &Chain{db: db}
 	err = db.Update(func(dbtx *bolt.Tx) error {
-		for _, name := range [][]byte{bBlocks, bHeight, bIndex, bUndo, bUTXO, bMeta, bMempool, bTxIndex} {
+		for _, name := range [][]byte{bBlocks, bHeight, bIndex, bUndo, bUTXO, bMeta, bMempool, bMempoolMeta, bMempoolSpnt, bTxIndex} {
 			if _, err := dbtx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -596,7 +598,9 @@ func connectTip(dbtx *bolt.Tx, b *Block, bh [32]byte) error {
 		return err
 	}
 	for _, k := range drop {
-		if err := mp.Delete(k); err != nil {
+		var id [32]byte
+		copy(id[:], k)
+		if err := removeFromMempool(dbtx, id); err != nil {
 			return err
 		}
 	}
@@ -673,10 +677,34 @@ func disconnectTip(dbtx *bolt.Tx) error {
 	if err := meta.Put(kTipWork, wb[:]); err != nil {
 		return err
 	}
-	mp := dbtx.Bucket(bMempool)
+	// Transactions from the disconnected block return to the pool. Their
+	// inputs were just restored to the UTXO set above, so the fee can be
+	// recomputed here and the pool indexes stay consistent.
 	for _, t := range b.Txs[1:] {
 		id := t.ID()
-		if err := mp.Put(id[:], t.Serialize()); err != nil {
+		raw := t.Serialize()
+		var in, out uint64
+		ok := true
+		for i := range t.Inputs {
+			v := utxos.Get(utxoKey(t.Inputs[i].Prev))
+			if v == nil {
+				ok = false
+				break
+			}
+			u, err := deserializeUTXO(v)
+			if err != nil {
+				ok = false
+				break
+			}
+			in += u.Value
+		}
+		for i := range t.Outputs {
+			out += t.Outputs[i].Value
+		}
+		if !ok || in < out {
+			continue // cannot be reinstated coherently; drop rather than guess
+		}
+		if err := addToMempool(dbtx, id, raw, t, in-out); err != nil {
 			return err
 		}
 	}
@@ -798,30 +826,125 @@ func (c *Chain) SubmitTx(t *Tx) error {
 		if mp.Get(id[:]) != nil {
 			return fmt.Errorf("transaction already pending")
 		}
-		pendingSpent := map[OutPoint]bool{}
-		err := mp.ForEach(func(k, v []byte) error {
-			pt, err := DeserializeTx(v)
-			if err != nil {
-				return err
+		// Conflicts are found by index rather than by walking the pool, so
+		// admission costs the same whether the pool holds ten transactions or
+		// thousands. The previous full scan made flooding quadratically
+		// expensive for the victim and linear for the attacker.
+		spent := dbtx.Bucket(bMempoolSpnt)
+		for i := range t.Inputs {
+			if holder := spent.Get(utxoKey(t.Inputs[i].Prev)); holder != nil {
+				return fmt.Errorf("input %d conflicts with a pending transaction", i)
 			}
-			for i := range pt.Inputs {
-				pendingSpent[pt.Inputs[i].Prev] = true
-			}
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 		next := getU64(dbtx.Bucket(bMeta), kTipHeight) + 1
-		fee, err := checkTx(dbtx, t, next, pendingSpent)
+		fee, err := checkTx(dbtx, t, next, nil)
 		if err != nil {
 			return err
 		}
 		if fee < MinRelayFee {
 			return fmt.Errorf("fee %s below minimum %s PER", FormatAmount(fee), FormatAmount(MinRelayFee))
 		}
-		return mp.Put(id[:], raw)
+
+		// Enforce the pool's capacity. When it is full a newcomer must pay a
+		// better rate than the worst resident, which it then displaces; this
+		// makes filling the pool cost the attacker progressively more instead
+		// of nothing.
+		rate := feeRate(fee, len(raw))
+		st := mp.Stats()
+		if st.KeyN >= MaxMempoolTxs || st.LeafInuse+len(raw) > MaxMempoolBytes {
+			worstID, worstRate, ok := worstInPool(dbtx)
+			if !ok || rate <= worstRate {
+				return fmt.Errorf("mempool is full and this fee rate does not displace anything")
+			}
+			if err := removeFromMempool(dbtx, worstID); err != nil {
+				return err
+			}
+		}
+		return addToMempool(dbtx, id, raw, t, fee)
 	})
+}
+
+// feeRate is fee per byte, scaled so that integer division keeps resolution.
+func feeRate(fee uint64, size int) uint64 {
+	if size <= 0 {
+		return 0
+	}
+	return fee * 1000 / uint64(size)
+}
+
+func mempoolMeta(fee uint64, size int) []byte {
+	w := &buf{}
+	w.u64(fee)
+	w.u32(uint32(size))
+	return w.b
+}
+
+func parseMempoolMeta(b []byte) (fee uint64, size int, ok bool) {
+	if len(b) != 12 {
+		return 0, 0, false
+	}
+	r := &rdr{b: b}
+	fee = r.u64()
+	size = int(r.u32())
+	return fee, size, r.done() == nil
+}
+
+func addToMempool(dbtx *bolt.Tx, id [32]byte, raw []byte, t *Tx, fee uint64) error {
+	if err := dbtx.Bucket(bMempool).Put(id[:], raw); err != nil {
+		return err
+	}
+	if err := dbtx.Bucket(bMempoolMeta).Put(id[:], mempoolMeta(fee, len(raw))); err != nil {
+		return err
+	}
+	spent := dbtx.Bucket(bMempoolSpnt)
+	for i := range t.Inputs {
+		if err := spent.Put(utxoKey(t.Inputs[i].Prev), id[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeFromMempool(dbtx *bolt.Tx, id [32]byte) error {
+	mp := dbtx.Bucket(bMempool)
+	if raw := mp.Get(id[:]); raw != nil {
+		if t, err := DeserializeTx(raw); err == nil {
+			spent := dbtx.Bucket(bMempoolSpnt)
+			for i := range t.Inputs {
+				key := utxoKey(t.Inputs[i].Prev)
+				// Only clear the reservation if it is still ours.
+				if h := spent.Get(key); h != nil && [32]byte(h) == id {
+					if err := spent.Delete(key); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	if err := mp.Delete(id[:]); err != nil {
+		return err
+	}
+	return dbtx.Bucket(bMempoolMeta).Delete(id[:])
+}
+
+// worstInPool finds the resident transaction paying the lowest fee rate.
+func worstInPool(dbtx *bolt.Tx) ([32]byte, uint64, bool) {
+	var worstID [32]byte
+	worstRate := ^uint64(0)
+	found := false
+	dbtx.Bucket(bMempoolMeta).ForEach(func(k, v []byte) error {
+		fee, size, ok := parseMempoolMeta(v)
+		if !ok || len(k) != 32 {
+			return nil
+		}
+		if r := feeRate(fee, size); r < worstRate {
+			worstRate = r
+			copy(worstID[:], k)
+			found = true
+		}
+		return nil
+	})
+	return worstID, worstRate, found
 }
 
 // NextBlockTemplate assembles an unsolved block on top of the tip: coinbase

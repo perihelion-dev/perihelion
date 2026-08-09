@@ -37,6 +37,8 @@ const (
 	MaxTxExtra           = 80
 	MinRelayFee   uint64 = 1_000 // peri
 
+	//
+
 	// GenesisTime: 2026-08-09 00:00:00 UTC — the mainnet start. The genesis
 	// block carries no reward and no transactions: fair launch, no premine,
 	// no founder allocation. Every PER in existence was mined after this
@@ -51,6 +53,16 @@ const (
 // the chain's identity: any chain built on a different message is a different
 // currency and can never merge with this one.
 const GenesisMessage = "Perihelion genesis 2026-08-09 — quantum-safe money, mined by everyone, owned by no one"
+
+// Mempool limits. These are node policy rather than consensus: they bound what
+// a node is willing to hold and relay, and an operator changing them never
+// forks the chain. Without a bound, anyone able to pay the minimum fee could
+// grow every node's database without limit — cheap on a young chain.
+// Variables so that tests can shrink them.
+var (
+	MaxMempoolTxs   = 5_000
+	MaxMempoolBytes = 32 << 20 // 32 MiB
+)
 
 // Argon2id proof-of-work parameters. Consensus-critical: changing them forks
 // the chain. Declared as variables only so tests can shrink the memory cost.
