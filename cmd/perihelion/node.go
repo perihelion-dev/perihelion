@@ -32,6 +32,7 @@ func cmdNode(args []string) error {
 	signalNames := fs.String("signal", "", "comma-separated deployment names this node's miner supports (see `perihelion governance`)")
 	advertise := fs.String("advertise", "", "public host:port to announce to peers (needed when --listen binds a wildcard address)")
 	rpcAddr := fs.String("rpc", "127.0.0.1:16181", `local RPC + dashboard address ("off" to disable)`)
+	maxPeers := fs.Int("maxpeers", 0, "maximum peer connections (0 = default; raise it on a public seed)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -96,6 +97,7 @@ func cmdNode(args []string) error {
 	})
 
 	node := p2p.New(c, logf)
+	node.SetMaxPeers(*maxPeers)
 	node.SetPeerStore(filepath.Join(*datadir, "peers.txt"))
 	if *advertise != "" {
 		node.SetAdvertisedAddress(*advertise)

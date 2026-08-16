@@ -7,13 +7,20 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"perihelion/core"
 )
 
 const (
-	maxPeers = 64
+	// defaultMaxPeers is what an ordinary node accepts. A node that publishes
+	// its address — above all a seed, which is where every newcomer arrives —
+	// should raise it: when the table fills, further connections are refused,
+	// and on a network with few published entry points that means nobody new
+	// can join at all. Observed in practice at 64, with the seed full and a
+	// legitimate participant locked out.
+	defaultMaxPeers = 256
 
 	// maxPeersPerHost bounds how many connections one address may hold. A
 	// single host — buggy, over-eager or hostile — otherwise fills the peer
@@ -84,6 +91,26 @@ type Node struct {
 
 	banMu  sync.Mutex
 	banned map[string]time.Time // host -> banned until
+
+	// peerLimit is atomic rather than guarded by n.mu, because it is read
+	// inside the section that already holds that lock while admitting a peer.
+	peerLimit atomic.Int64
+}
+
+// SetMaxPeers raises or lowers how many connections this node accepts. Seeds
+// want a high limit: a full table turns away newcomers, and a network with
+// one published entry point then stops growing.
+func (n *Node) SetMaxPeers(limit int) {
+	if limit > 0 {
+		n.peerLimit.Store(int64(limit))
+	}
+}
+
+func (n *Node) maxPeers() int {
+	if v := n.peerLimit.Load(); v > 0 {
+		return int(v)
+	}
+	return defaultMaxPeers
 }
 
 // hostOf extracts the bare host from a "host:port" endpoint.
@@ -427,7 +454,7 @@ func (n *Node) acceptLoop(ln net.Listener) {
 		}
 		host := hostOf(conn.RemoteAddr().String())
 		n.mu.Lock()
-		full := len(n.peers) >= maxPeers
+		full := len(n.peers) >= n.maxPeers()
 		n.mu.Unlock()
 		if full || n.isBanned(host) || n.peersFromHost(host) >= maxPeersPerHost {
 			conn.Close()
@@ -549,7 +576,7 @@ func (n *Node) handleConn(conn net.Conn, outbound bool) {
 		}
 	}
 	_, dup := n.peers[p.name]
-	if dup || len(n.peers) >= maxPeers || sameHost >= maxPeersPerHost {
+	if dup || len(n.peers) >= n.maxPeers() || sameHost >= maxPeersPerHost {
 		n.mu.Unlock()
 		return
 	}
