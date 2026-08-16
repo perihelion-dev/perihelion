@@ -152,6 +152,7 @@ func (e *explorer) routes() http.Handler {
 	mux.HandleFunc("/api", e.apiIndex)
 	mux.HandleFunc("/api/status", e.apiStatus)
 	mux.HandleFunc("/api/miners", e.apiMiners)
+	mux.HandleFunc("/api/holders", e.apiHolders)
 	mux.HandleFunc("/api/block/", e.apiBlock)
 	mux.HandleFunc("/api/tx/", e.apiTx)
 	mux.HandleFunc("/api/address/", e.apiAddress)
@@ -392,6 +393,64 @@ func (e *explorer) apiMiners(w http.ResponseWriter, r *http.Request) {
 		// Saying so plainly is more useful than leaving it to be inferred.
 		"majority_held_by_one": top > 50,
 		"miners":               list,
+	})
+}
+
+// apiHolders reports how ownership is distributed: the largest holdings, what
+// share of everything in existence they represent, and how many addresses
+// hold anything at all. Concentration of ownership is one of the few things
+// about a currency that can be checked rather than believed, so it is served
+// alongside everything else rather than left for people to compute.
+func (e *explorer) apiHolders(w http.ResponseWriter, r *http.Request) {
+	limit := 25
+	if s := r.URL.Query().Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > 200 {
+			apiError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		limit = n
+	}
+	top, total, distinct, err := e.chain.TopHolders(limit)
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "chain unavailable")
+		return
+	}
+	if total == 0 {
+		apiError(w, http.StatusNotFound, "nothing held yet")
+		return
+	}
+
+	type entry struct {
+		Address   string  `json:"address"`
+		Held      string  `json:"held"`
+		Share     float64 `json:"share_percent"`
+		Spendable string  `json:"spendable"`
+		Immature  string  `json:"immature"`
+		Outputs   int     `json:"outputs"`
+	}
+	list := make([]entry, 0, len(top))
+	var topTen uint64
+	for i, h := range top {
+		held := h.Spendable + h.Immature
+		if i < 10 {
+			topTen += held
+		}
+		list = append(list, entry{
+			Address:   core.EncodeAddress(h.Addr),
+			Held:      core.FormatAmount(held),
+			Share:     float64(held) * 100 / float64(total),
+			Spendable: core.FormatAmount(h.Spendable),
+			Immature:  core.FormatAmount(h.Immature),
+			Outputs:   h.Outputs,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_held":       core.FormatAmount(total),
+		"distinct_holders": distinct,
+		"top_ten_share":    float64(topTen) * 100 / float64(total),
+		"largest_share":    list[0].Share,
+		"holders":          list,
 	})
 }
 

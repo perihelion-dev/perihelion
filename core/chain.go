@@ -1196,6 +1196,61 @@ func (c *Chain) AuditSupply() (*SupplyAudit, error) {
 	return a, nil
 }
 
+// Holder is an address and what it currently holds.
+type Holder struct {
+	Addr      [32]byte
+	Spendable uint64
+	Immature  uint64
+	Outputs   int
+}
+
+// TopHolders aggregates the unspent output set by address and returns the
+// largest holdings, plus the total held and the number of distinct addresses.
+//
+// How concentrated a currency's ownership is says more about it than any
+// claim its authors make, and it is derivable by anyone from the chain — so
+// it may as well be easy to derive.
+func (c *Chain) TopHolders(limit int) (top []Holder, total uint64, distinct int, err error) {
+	byAddr := map[[32]byte]*Holder{}
+	err = c.db.View(func(dbtx *bolt.Tx) error {
+		next := getU64(dbtx.Bucket(bMeta), kTipHeight) + 1
+		return dbtx.Bucket(bUTXO).ForEach(func(k, v []byte) error {
+			u, uerr := deserializeUTXO(v)
+			if uerr != nil {
+				return uerr
+			}
+			h, ok := byAddr[u.Addr]
+			if !ok {
+				h = &Holder{Addr: u.Addr}
+				byAddr[u.Addr] = h
+			}
+			if u.Coinbase && next-u.Height < CoinbaseMaturity {
+				h.Immature += u.Value
+			} else {
+				h.Spendable += u.Value
+			}
+			h.Outputs++
+			total += u.Value
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	all := make([]Holder, 0, len(byAddr))
+	for _, h := range byAddr {
+		all = append(all, *h)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].Spendable+all[i].Immature > all[j].Spendable+all[j].Immature
+	})
+	distinct = len(all)
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all, total, distinct, nil
+}
+
 // TipInfo returns the active tip's height and hash.
 func (c *Chain) TipInfo() (uint64, [32]byte, error) {
 	var height uint64
