@@ -86,7 +86,7 @@ func main() {
 			}
 		}
 	} else {
-		peers = []string{p2p.DefaultSeed}
+		peers = append([]string{}, p2p.DefaultSeeds...)
 	}
 	pl := *p2pListen
 	if pl == "off" {

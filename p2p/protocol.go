@@ -22,9 +22,8 @@ const (
 	MaxPayload      = 4 << 20
 	DefaultPort     = 16180
 
-	// DefaultSeed is the public bootstrap node a fresh install dials to join
-	// the network. Seeds are only entry points: once a node has peers it no
-	// longer depends on them, and anyone can run one.
+	// DefaultSeed is the first entry point a fresh install dials. Kept as a
+	// single value for callers that want one; DefaultSeeds is the real list.
 	DefaultSeed = "186.240.157.169:16180"
 
 	msgHello          = 1
@@ -174,4 +173,18 @@ func decodeGetBlocks(p []byte) (uint64, uint32, error) {
 		return 0, 0, fmt.Errorf("bad getblocks")
 	}
 	return binary.BigEndian.Uint64(p[0:8]), binary.BigEndian.Uint32(p[8:12]), nil
+}
+
+// DefaultSeeds are the entry points a fresh install dials to find the
+// network. They matter only until a node has peers of its own: from then on
+// it uses its address book and does not consult a seed again.
+//
+// More than one is not a nicety. A seed that is unreachable — down, full, or
+// blocked — does not slow a network down, it stops new participants joining
+// while everything already connected carries on looking healthy. Any node
+// that accepts inbound connections can serve as one, and the list is meant to
+// grow with entries run by people other than this project.
+var DefaultSeeds = []string{
+	"186.240.157.169:16180",
+	"187.124.167.107:16180",
 }

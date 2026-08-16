@@ -181,7 +181,7 @@ func seedPeers(datadir string) []string {
 		}
 	}
 	if len(out) == 0 {
-		out = append(out, p2p.DefaultSeed)
+		out = append(out, p2p.DefaultSeeds...)
 	}
 	return out
 }
