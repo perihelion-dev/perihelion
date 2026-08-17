@@ -32,7 +32,7 @@ func TestHelloIsAppendOnly(t *testing.T) {
 	// A handshake from a future version carrying an extra trailing field must
 	// still yield the fields this version understands.
 	future := append(encodeHello(ProtocolVersion, 7, tip, "1.2.3.4:16180"), 0xff, 0xff, 0xff)
-	ver, height, gotTip, addr, err = decodeHello(future)
+	_, height, gotTip, addr, err = decodeHello(future)
 	if err != nil {
 		t.Fatalf("handshake with unknown trailing data rejected: %v", err)
 	}

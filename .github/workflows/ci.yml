@@ -1,0 +1,92 @@
+# Continuous verification. Every push and pull request runs the full test
+# suite under the race detector, static analysis, the vulnerability scanner,
+# and a short fuzzing pass over every parser that accepts network input.
+#
+# The consensus packages (core, p2p, wallet) must pass everything with zero
+# findings. The graphical wallet is built to prove it compiles but is not
+# held to the same static-analysis bar, since UI-framework deprecations are
+# noise rather than risk.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests + race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build (all packages)
+        run: go build ./...
+      - name: Vet
+        run: go vet ./core/ ./p2p/ ./wallet/ ./cmd/perihelion/ ./cmd/perihelion-explorer/
+      - name: Test with race detector
+        run: go test -race -timeout 15m ./core/ ./p2p/ ./wallet/
+      - name: Consensus vectors unchanged
+        # Fails if any consensus encoding moved from what docs/test-vectors.json pins.
+        run: go test ./core/ -run 'TestVectorsStable|TestMainnetGenesisUnchanged' -v
+
+  static:
+    name: static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: staticcheck (consensus packages must be clean)
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./core/ ./p2p/ ./wallet/
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  fuzz:
+    name: fuzz parsers
+    runs-on: ubuntu-latest
+    # Fuzzing is time-boxed so CI stays fast; a longer nightly run lives in
+    # fuzz-nightly.yml. Both use the same targets.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Fuzz core parsers
+        run: |
+          for t in FuzzDeserializeTx FuzzDeserializeBlock FuzzDeserializeHeader FuzzAddress FuzzAmount; do
+            go test ./core/ -run '^$' -fuzz="^${t}\$" -fuzztime=20s || exit 1
+          done
+      - name: Fuzz wire protocol
+        run: |
+          for t in FuzzDecodeHello FuzzDecodeAddrs FuzzDecodeGetBlocks; do
+            go test ./p2p/ -run '^$' -fuzz="^${t}\$" -fuzztime=20s || exit 1
+          done
+      - name: Fuzz recovery phrase parser
+        run: go test ./wallet/ -run '^$' -fuzz='^FuzzMnemonic$' -fuzztime=20s
+
+  build-matrix:
+    name: builds on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build node, explorer
+        run: |
+          go build ./cmd/perihelion
+          go build ./cmd/perihelion-explorer

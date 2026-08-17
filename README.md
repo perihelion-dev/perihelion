@@ -10,6 +10,16 @@ Mainnet genesis: 2026-08-09 00:00:00 UTC · No premine · MIT licensed
 
 ---
 
+> **This is experimental software.** It has not had an independent security
+> audit. The network is days old and its hashrate is small, so recent history
+> is cheap to rewrite. Its coins have no market value and may never have one.
+> Do not put in anything you cannot afford to lose entirely. What the project
+> does instead of asking for trust: every consensus rule is enforced by every
+> node, the supply can be audited by anyone (`perihelion audit`), the early
+> mining distribution is published in `docs/ROADMAP.md`, and every push runs
+> the full test suite under the race detector, static analysis and fuzzing.
+
+
 Perihelion is a from-scratch cryptocurrency built for the next thirty years
 rather than the last fifteen. Its signatures use NIST-standardised
 post-quantum cryptography from block one, its proof-of-work is designed so

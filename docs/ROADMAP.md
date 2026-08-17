@@ -29,27 +29,27 @@ cleanly announced restart after a proper public testnet is a real question. It
 becomes harder to answer well the longer it is deferred: eight days of history
 is cheap to lose; eight months is not.
 
-## Phase 1 — now
+## Phase 1 — done (2026-08-17)
 
-1. **Testnet and regtest, strictly separated from mainnet.** Own genesis,
+1. ✅ **Testnet and regtest, strictly separated from mainnet.** Own genesis,
    own address prefix (`tper1…`), own port, own network magic, trivial
    difficulty, `--regtest` for fully local runs, and a loud warning when a
    mainnet node is mining in isolation. Today a private fork from the same
    genesis produces coins indistinguishable from real PER until they vanish
    on reconnection — that must be impossible to confuse.
-2. **Chain-ID mandatory now, not at block 60,000.** With almost no
+2. ✅ **Chain-ID mandatory at block 15,000** (from 60,000). With almost no
    transactions and no market value, the deferred switchover buys nothing and
    leaves a replay window open. Publish signature test vectors and an exact
    serialisation spec.
-3. **Automatic money-supply invariants on every block.** `perihelion audit`
+3. ✅ **Automatic money-supply invariants on every block.** `perihelion audit`
    run by hand is not enough. Enforce in validation: inputs = outputs + fees;
    coinbase ≤ permitted; no duplicate input; no integer overflow; supply ≤
    emission. A previously fixed critical bug — duplicate inputs minting coins
    from nothing — is exactly the class these catch.
-4. **CI, fuzzing, race detector, static analysis, dependency scanning.**
+4. ✅ **CI, fuzzing, race detector, static analysis, dependency scanning.**
    Continuous fuzzing of every network and transaction parser.
-5. **`SECURITY.md` and a responsible-disclosure channel.**
-6. **Precise labelling as experimental software**, everywhere.
+5. ✅ **`SECURITY.md` and a responsible-disclosure channel.**
+6. ✅ **Precise labelling as experimental software**, at the top of the README.
 
 ## Phase 2 — after Phase 1 holds
 

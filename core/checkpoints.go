@@ -44,16 +44,6 @@ func checkpointConflict(height uint64, hash [32]byte) bool {
 	return ok && want != hash
 }
 
-// belowLastCheckpoint reports whether proof-of-work may be assumed for a
-// block: true when it sits at or below the newest checkpoint AND the chain
-// being extended actually passes through that checkpoint. The second
-// condition matters — a block "below the checkpoint height" on a branch that
-// never reaches the checkpoint hash is not covered by it and must be checked
-// in full.
-func belowLastCheckpoint(height uint64) bool {
-	return height <= LastCheckpointHeight()
-}
-
 func mustHash(hexStr string) [32]byte {
 	var h [32]byte
 	if len(hexStr) != 64 {

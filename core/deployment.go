@@ -107,15 +107,6 @@ func (s ThresholdState) String() string {
 	return "unknown"
 }
 
-// windowStart returns the first height of the tally window containing h,
-// aligned to the deployment's start.
-func windowStart(d Deployment, h uint64) uint64 {
-	if h < d.StartHeight {
-		return d.StartHeight
-	}
-	return d.StartHeight + ((h-d.StartHeight)/SignalWindow)*SignalWindow
-}
-
 // minerSignalBits is what this node's miner signals support for. It is a local
 // choice: every operator decides independently, which is precisely what makes
 // the tally a measurement of the network rather than of any one participant.
