@@ -95,6 +95,8 @@ type Node struct {
 	// peerLimit is atomic rather than guarded by n.mu, because it is read
 	// inside the section that already holds that lock while admitting a peer.
 	peerLimit atomic.Int64
+
+	isolationWarned atomic.Bool
 }
 
 // SetMaxPeers raises or lowers how many connections this node accepts. Seeds
@@ -191,7 +193,17 @@ func (n *Node) Synced() bool {
 	}
 	n.mu.Unlock()
 	if peerCount == 0 {
-		return time.Since(n.startedAt) > isolationGrace
+		if time.Since(n.startedAt) <= isolationGrace {
+			return false
+		}
+		// On mainnet, mining with no peers means building a private branch
+		// that the real network will discard the moment we reconnect — the
+		// coins look real and are not. Regtest is meant to be alone; on any
+		// other network say so, loudly, once.
+		if core.Active() != core.Regtest && n.isolationWarned.CompareAndSwap(false, true) {
+			n.logf("WARNING: no peers reachable — mining on %s in isolation. Any blocks found now form a private branch that the network will discard once you reconnect; the coins are not real. Check your connection and seeds.", core.Active().Name)
+		}
+		return true
 	}
 	height, _, err := n.chain.TipInfo()
 	if err != nil {

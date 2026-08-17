@@ -24,7 +24,7 @@ import (
 func cmdNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	datadir := fs.String("datadir", defaultDataDir(), "data directory")
-	listen := fs.String("listen", fmt.Sprintf(":%d", p2p.DefaultPort), `P2P listen address ("off" to disable — outbound connections only)`)
+	listen := fs.String("listen", fmt.Sprintf(":%d", p2p.DefaultPort()), `P2P listen address ("off" to disable — outbound connections only)`)
 	connect := fs.String("connect", "", `comma-separated peer addresses (host:port); empty uses ~/.perihelion/seeds.txt or the built-in seed, "none" disables outbound`)
 	mine := fs.Bool("mine", false, "mine while running the node")
 	mineto := fs.String("mineto", "", "mine to this address instead of the local wallet (per1...); lets a server mine without holding any keys")
@@ -181,7 +181,7 @@ func seedPeers(datadir string) []string {
 		}
 	}
 	if len(out) == 0 {
-		out = append(out, p2p.DefaultSeeds...)
+		out = append(out, p2p.DefaultSeeds()...)
 	}
 	return out
 }

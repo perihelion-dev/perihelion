@@ -24,11 +24,7 @@ package core
 //     software that ships a wrong one simply forks itself off the network.
 //
 // Every checkpoint carries the date it was added, so its age is visible.
-var Checkpoints = map[uint64][32]byte{
-	// Added 2026-08-17. Block mined 2026-08-17 06:06 UTC, buried under ~700
-	// blocks at the time of adding.
-	12000: mustHash("138825d4f146c8aa85281eaf517664f2704860707dabd43ce449d373e66d0570"),
-}
+var Checkpoints = Mainnet.Checkpoints
 
 // LastCheckpointHeight is the highest checkpointed height, or 0.
 func LastCheckpointHeight() uint64 {

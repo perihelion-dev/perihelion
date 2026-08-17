@@ -27,6 +27,13 @@ func DifficultyOf(target [32]byte) *big.Int {
 // matters for a chain whose solar-powered miners join and leave with the sun;
 // Bitcoin's two-week adjustment would swing wildly under such hashrate tides.
 func NextTarget(headers []*BlockHeader) [32]byte {
+	// Regtest never retargets: every block is minable at the floor, so a
+	// test suite or a local experiment never waits on proof-of-work. This is
+	// a property of the regtest network only and cannot leak into mainnet,
+	// whose Network definition does not set it.
+	if Active().AllowMinDifficultyBlocks {
+		return TargetToBytes(InitialTarget())
+	}
 	n := len(headers) - 1
 	if n < DifficultyWindow {
 		return TargetToBytes(InitialTarget())

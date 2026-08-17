@@ -51,13 +51,13 @@ func readSeeds() []string {
 		}
 	}
 	if len(out) == 0 {
-		out = append(out, defaultSeeds...)
+		out = append(out, defaultSeeds()...)
 	}
 	return out
 }
 
 // defaultSeeds are where a fresh install looks for the network.
-var defaultSeeds = p2p.DefaultSeeds
+func defaultSeeds() []string { return p2p.DefaultSeeds() }
 
 type appState struct {
 	win    fyne.Window

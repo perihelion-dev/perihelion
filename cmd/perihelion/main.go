@@ -22,12 +22,18 @@ import (
 	"perihelion/wallet"
 )
 
+// stdinReader is shared by every non-interactive prompt. A fresh
+// bufio.Reader per call would swallow whatever the previous one buffered
+// beyond the first line, so a piped "password\npassword\n" would appear as
+// one password followed by an empty one.
+var stdinReader = bufio.NewReader(os.Stdin)
+
 // promptPassword reads a password from the terminal without echoing it.
 func promptPassword(prompt string) (string, error) {
 	fmt.Print(prompt)
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		// Non-interactive (piped) input: read a line as fallback.
-		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, _ := stdinReader.ReadString('\n')
 		return strings.TrimRight(line, "\r\n"), nil
 	}
 	b, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -38,12 +44,52 @@ func promptPassword(prompt string) (string, error) {
 	return string(b), nil
 }
 
+// defaultDataDir is per network, so mainnet, testnet and regtest never share
+// a chain database or a wallet: ~/.perihelion, ~/.perihelion-testnet,
+// ~/.perihelion-regtest.
 func defaultDataDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".perihelion"
+		return ".perihelion" + core.Active().DataDirSuffix
 	}
-	return filepath.Join(home, ".perihelion")
+	return filepath.Join(home, ".perihelion"+core.Active().DataDirSuffix)
+}
+
+// selectNetworkFromArgs consumes a leading --network/--testnet/--regtest
+// option before any subcommand runs, so that every default (data directory,
+// ports, seeds, address prefix, genesis) is already correct when the
+// subcommand reads it. It is a global choice: a process runs on one network.
+func selectNetworkFromArgs(args []string) []string {
+	out := args[:0:0]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--testnet" || a == "-testnet":
+			core.SelectNetwork(core.Testnet)
+		case a == "--regtest" || a == "-regtest":
+			core.SelectNetwork(core.Regtest)
+		case a == "--mainnet" || a == "-mainnet":
+			core.SelectNetwork(core.Mainnet)
+		case strings.HasPrefix(a, "--network=") || strings.HasPrefix(a, "-network="):
+			n, err := core.NetworkByName(a[strings.Index(a, "=")+1:])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(2)
+			}
+			core.SelectNetwork(n)
+		case (a == "--network" || a == "-network") && i+1 < len(args):
+			n, err := core.NetworkByName(args[i+1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(2)
+			}
+			core.SelectNetwork(n)
+			i++
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func openChain(datadir string) (*core.Chain, error) {
@@ -88,36 +134,40 @@ func loadWallet(datadir string) (*wallet.Wallet, error) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	args := selectNetworkFromArgs(os.Args[1:])
+	if len(args) < 1 {
 		usage()
 		os.Exit(2)
 	}
+	if core.Active() != core.Mainnet {
+		fmt.Fprintf(os.Stderr, "[%s] coins on this network are worthless by design\n", strings.ToUpper(core.Active().Name))
+	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "wallet":
-		err = cmdWallet(os.Args[2:])
+		err = cmdWallet(args[1:])
 	case "balance":
-		err = cmdBalance(os.Args[2:])
+		err = cmdBalance(args[1:])
 	case "mine":
-		err = cmdMine(os.Args[2:])
+		err = cmdMine(args[1:])
 	case "node":
-		err = cmdNode(os.Args[2:])
+		err = cmdNode(args[1:])
 	case "send":
-		err = cmdSend(os.Args[2:])
+		err = cmdSend(args[1:])
 	case "info":
-		err = cmdInfo(os.Args[2:])
+		err = cmdInfo(args[1:])
 	case "block":
-		err = cmdBlock(os.Args[2:])
+		err = cmdBlock(args[1:])
 	case "governance":
-		err = cmdGovernance(os.Args[2:])
+		err = cmdGovernance(args[1:])
 	case "miners":
-		err = cmdMiners(os.Args[2:])
+		err = cmdMiners(args[1:])
 	case "audit":
-		err = cmdAudit(os.Args[2:])
+		err = cmdAudit(args[1:])
 	case "help", "-h", "--help":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
 		usage()
 		os.Exit(2)
 	}
@@ -146,7 +196,12 @@ Usage:
   perihelion miners [--from N] [--to N]        who actually mined the blocks, by reward address
   perihelion audit                             verify that no coin exists outside the rules
 
-All commands accept --datadir DIR (default ~/.perihelion).
+All commands accept --datadir DIR (default ~/.perihelion, ~/.perihelion-testnet, …).
+
+Network selection (place before the command):
+  --testnet      public test network — separate chain, addresses start with tper1
+  --regtest      private local network — trivial difficulty, no peers, rper1 addresses
+  (default is mainnet)
 `)
 }
 
@@ -359,8 +414,7 @@ func cmdWallet(args []string) error {
 			return fmt.Errorf("wallet already exists at %s — move it aside before restoring", path)
 		}
 		fmt.Println("Enter your 24-word recovery phrase (all on one line):")
-		reader := bufio.NewReader(os.Stdin)
-		line, _ := reader.ReadString('\n')
+		line, _ := stdinReader.ReadString('\n')
 		pw, err := newPassword()
 		if err != nil {
 			return err

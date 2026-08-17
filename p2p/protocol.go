@@ -13,18 +13,13 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"perihelion/core"
 )
 
 const (
-	// Magic prefixes every frame; connections speaking anything else are dropped.
-	Magic           = 0x50455231 // "PER1"
 	ProtocolVersion = 1
 	MaxPayload      = 4 << 20
-	DefaultPort     = 16180
-
-	// DefaultSeed is the first entry point a fresh install dials. Kept as a
-	// single value for callers that want one; DefaultSeeds is the real list.
-	DefaultSeed = "186.240.157.169:16180"
 
 	msgHello          = 1
 	msgGetBlocks      = 2
@@ -48,7 +43,7 @@ func writeFrame(conn net.Conn, t byte, payload []byte) error {
 		return fmt.Errorf("payload too large")
 	}
 	hdr := make([]byte, 9)
-	binary.BigEndian.PutUint32(hdr[0:4], Magic)
+	binary.BigEndian.PutUint32(hdr[0:4], wireMagic())
 	hdr[4] = t
 	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
@@ -65,7 +60,7 @@ func readFrame(conn net.Conn) (byte, []byte, error) {
 	if _, err := io.ReadFull(conn, hdr); err != nil {
 		return 0, nil, err
 	}
-	if binary.BigEndian.Uint32(hdr[0:4]) != Magic {
+	if binary.BigEndian.Uint32(hdr[0:4]) != wireMagic() {
 		return 0, nil, fmt.Errorf("bad magic — not a perihelion peer")
 	}
 	n := binary.BigEndian.Uint32(hdr[5:9])
@@ -175,16 +170,17 @@ func decodeGetBlocks(p []byte) (uint64, uint32, error) {
 	return binary.BigEndian.Uint64(p[0:8]), binary.BigEndian.Uint32(p[8:12]), nil
 }
 
-// DefaultSeeds are the entry points a fresh install dials to find the
-// network. They matter only until a node has peers of its own: from then on
-// it uses its address book and does not consult a seed again.
-//
-// More than one is not a nicety. A seed that is unreachable — down, full, or
-// blocked — does not slow a network down, it stops new participants joining
-// while everything already connected carries on looking healthy. Any node
-// that accepts inbound connections can serve as one, and the list is meant to
-// grow with entries run by people other than this project.
-var DefaultSeeds = []string{
-	"186.240.157.169:16180",
-	"187.124.167.107:16180",
-}
+// wireMagic is the frame prefix for the active network. Nodes on different
+// networks (mainnet, testnet, regtest) use different values, so a connection
+// between them fails at the very first frame — they cannot accidentally sync
+// each other's chains, and a testnet coin can never be mistaken for a mainnet
+// one because the two networks are unable to exchange a single message.
+func wireMagic() uint32 { return core.Active().WireMagic }
+
+// DefaultPort is the P2P port for the active network.
+func DefaultPort() int { return core.Active().DefaultPort }
+
+// DefaultSeeds are the entry points a fresh install dials to find the active
+// network. They matter only until a node has peers of its own. Regtest has
+// none: it is private by definition.
+func DefaultSeeds() []string { return append([]string{}, core.Active().Seeds...) }

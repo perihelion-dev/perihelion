@@ -265,6 +265,34 @@ rules that applied equally to everyone.
 - [ ] Reproducible builds, so independently compiled binaries can be compared
 - [ ] Independent security audit
 
+## Networks
+
+Perihelion runs three networks, separated on every layer that could cause
+confusion — genesis, address prefix, chain-ID, wire magic, port and data
+directory — so nothing on one can ever be mistaken for the other:
+
+| | Mainnet | Testnet | Regtest |
+|---|---|---|---|
+| Purpose | the real thing | public experiments | private, local |
+| Address prefix | `per1` | `tper1` | `rper1` |
+| Port | 16180 | 26180 | 36180 |
+| Data directory | `~/.perihelion` | `~/.perihelion-testnet` | `~/.perihelion-regtest` |
+| Coins worth | whatever the world decides | **nothing, by design** | nothing |
+| Difficulty floor | 16 | 4 | 1, never retargets |
+| Seeds | two published | one published | none |
+
+```
+perihelion --testnet wallet new       # a tper1… address
+perihelion --testnet node --mine      # join the public testnet
+perihelion --regtest mine --blocks 100   # instant private chain for testing
+```
+
+A mainnet wallet rejects a testnet address with an error that names the
+network. A mainnet node cannot complete a handshake with a testnet node. A
+data directory refuses to open under a different network than it was created
+for. Mining on mainnet with no peers reachable logs a loud warning that the
+blocks are private and the coins are not real.
+
 ## Scheduled change: signatures bind to the chain from height 60,000
 
 From block 60,000 a transaction signature must commit to the chain's identity,

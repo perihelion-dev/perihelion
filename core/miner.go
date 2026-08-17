@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"runtime"
 	"sync"
@@ -69,6 +70,14 @@ func MineLoop(ctx context.Context, c *Chain, addr [32]byte, count int, opts Mine
 		}
 		tmpl.Header = *solved
 		if err := c.AcceptBlock(tmpl); err != nil {
+			// A solved block being refused is normal when the tip moved under
+			// us — the next iteration builds on the new tip. If the tip did
+			// NOT move, the template itself is unacceptable (a clock far off,
+			// a misconfigured network) and retrying forever would spin at
+			// full CPU while looking like mining. Fail loudly instead.
+			if c.TipEpoch() == epoch {
+				return fmt.Errorf("own block rejected with tip unchanged — refusing to loop: %w", err)
+			}
 			logf("solved block no longer fits the chain (%v) — restarting on new tip", err)
 			continue
 		}

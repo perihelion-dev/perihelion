@@ -37,6 +37,7 @@ var (
 	kPool      = []byte("pool")
 	kEmitted   = []byte("emitted")
 	kBurned    = []byte("burned")
+	kNetwork   = []byte("network") // which network this database belongs to
 )
 
 var two256 = new(big.Int).Lsh(big.NewInt(1), 256)
@@ -187,6 +188,18 @@ func Open(path string) (*Chain, error) {
 			}
 		}
 		meta := dbtx.Bucket(bMeta)
+		// A database belongs to exactly one network. Refuse to open a mainnet
+		// database as testnet or vice versa: the genesis blocks differ, so
+		// the stored chain would be nonsense under the other rules, and the
+		// wallet next to it would hold coins that do not exist on this chain.
+		if stored := meta.Get(kNetwork); stored != nil {
+			if string(stored) != Active().Name {
+				return fmt.Errorf("this data directory belongs to %s, but the node is running on %s — use a different --datadir",
+					string(stored), Active().Name)
+			}
+		} else if err := meta.Put(kNetwork, []byte(Active().Name)); err != nil {
+			return err
+		}
 		if tip := meta.Get(kTip); tip != nil {
 			if dbtx.Bucket(bIndex).Get(tip) == nil {
 				if err := rebuildIndex(dbtx); err != nil {
@@ -302,7 +315,7 @@ func (c *Chain) TipEpoch() uint64 { return c.epoch.Load() }
 // every signature ever made. The message is a constant and is already what
 // declares the chain's identity.
 func ChainID() [32]byte {
-	return H([]byte("PER:chainid"), []byte(GenesisMessage))
+	return H([]byte("PER:chainid"), []byte(Active().GenesisMessage))
 }
 
 // GenesisBlock is the hardcoded block 0. It carries no transactions and no
@@ -312,8 +325,8 @@ func GenesisBlock() *Block {
 	return &Block{Header: BlockHeader{
 		Version:    1,
 		Height:     0,
-		Time:       GenesisTime,
-		MerkleRoot: H([]byte("PER:genesis"), []byte(GenesisMessage)),
+		Time:       Active().GenesisTime,
+		MerkleRoot: H([]byte("PER:genesis"), []byte(Active().GenesisMessage)),
 		Target:     TargetToBytes(InitialTarget()),
 	}}
 }
