@@ -458,14 +458,11 @@ func buildSend(c *core.Chain, w *Wallet, to [32]byte, amount, fee uint64, ref []
 	if change := sum - need; change > 0 {
 		tx.Outputs = append(tx.Outputs, core.TxOutput{Value: change, Addr: w.Address()})
 	}
-	// Sign with the digest the network will require for the block this is
-	// likely to land in. Before the switchover both forms verify, so a wallet
-	// that is upgraded early still produces transactions older nodes accept.
-	height, _, err := c.TipInfo()
-	if err != nil {
-		return nil, err
-	}
-	digest := tx.SigDigestAt(height + 1)
+	// Always sign chain-bound. Below the switchover height both forms verify,
+	// so this loses nothing; at and above it, only this form is valid. Signing
+	// the legacy form for any reason would create a transaction that a fork
+	// sharing this history could replay.
+	digest := tx.SigDigestV2()
 	pb := w.PubBytes()
 	sig := w.Sign(digest[:])
 	for i := range tx.Inputs {

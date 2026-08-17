@@ -50,16 +50,22 @@ const (
 )
 
 // SighashChainIDHeight is the height from which transaction signatures must
-// commit to the chain's identity (see Tx.SigDigestV2). Until then both the
-// original and the chain-bound digest are accepted, so nodes and wallets can
-// be upgraded gradually rather than in lockstep; from this height only the
+// commit to the chain's identity (see Tx.SigDigestV2). Below it both the
+// original and the chain-bound digest are accepted; from it, only the
 // chain-bound form is valid.
 //
-// The date is chosen far enough ahead that anyone running a node has time to
-// update, and the change is safe to make at all only because the chain has
-// carried no transaction yet — every output so far is a coinbase, which has
-// no signature to invalidate.
-const SighashChainIDHeight uint64 = 60_000
+// Originally scheduled for block 60,000. Brought forward to 15,000 on
+// 2026-08-17 (roughly 36 hours' notice from height 12,825) because the
+// original margin bought nothing: the chain has carried fourteen transactions
+// in total, all long confirmed, so there is no pending old-format signature
+// to invalidate — and every day the switch waits is a day a fork sharing this
+// history could replay a payment. Wallets have signed chain-bound since the
+// change was introduced. Nodes on the network at the time of this change
+// already accept the chain-bound form, so no upgrade is needed to keep
+// following the chain; only a node that refuses to update its consensus rules
+// would diverge, and only if a legacy-signed transaction were mined after the
+// switch, which no current wallet produces.
+const SighashChainIDHeight uint64 = 15_000
 
 // GenesisMessage is committed to by the genesis block's merkle root. It fixes
 // the chain's identity: any chain built on a different message is a different

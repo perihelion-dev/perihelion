@@ -389,18 +389,21 @@ func headersBack(dbtx *bolt.Tx, from [32]byte, count int) ([]*BlockHeader, error
 // checkTx validates a non-coinbase transaction (existence, maturity, values,
 // signatures) against the UTXO set and returns its fee. It reads the spent map
 // to reject conflicts but never writes it; the caller records accepted spends.
-func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint64, error) {
+// checkTx validates a non-coinbase transaction against the UTXO set and
+// returns its fee and its total input value. Both are returned so that the
+// block ledger can re-derive the fee independently rather than trust it.
+func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (fee uint64, inSum uint64, err error) {
 	if len(t.Inputs) == 0 || len(t.Inputs) > 1_000 {
-		return 0, fmt.Errorf("bad input count")
+		return 0, 0, fmt.Errorf("bad input count")
 	}
 	if len(t.Outputs) == 0 || len(t.Outputs) > 1_000 {
-		return 0, fmt.Errorf("bad output count")
+		return 0, 0, fmt.Errorf("bad output count")
 	}
 	if len(t.Extra) > MaxTxExtra {
-		return 0, fmt.Errorf("extra data too large")
+		return 0, 0, fmt.Errorf("extra data too large")
 	}
 	utxos := dbtx.Bucket(bUTXO)
-	var inSum, outSum uint64
+	var outSum uint64
 	// A transaction must not list the same output twice. Without this the
 	// value of a single unspent output would be counted once per mention,
 	// letting anyone holding one coin claim several — coins created from
@@ -410,33 +413,37 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 	for i := range t.Inputs {
 		op := t.Inputs[i].Prev
 		if _, dup := seen[op]; dup {
-			return 0, fmt.Errorf("input %d: output already spent by input of the same transaction", i)
+			return 0, 0, fmt.Errorf("input %d: output already spent by input of the same transaction", i)
 		}
 		seen[op] = struct{}{}
 		if spent[op] {
-			return 0, fmt.Errorf("input %d: double spend", i)
+			return 0, 0, fmt.Errorf("input %d: double spend", i)
 		}
 		raw := utxos.Get(utxoKey(op))
 		if raw == nil {
-			return 0, fmt.Errorf("input %d: unknown or spent output", i)
+			return 0, 0, fmt.Errorf("input %d: unknown or spent output", i)
 		}
 		u, err := deserializeUTXO(raw)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		if u.Coinbase && height-u.Height < CoinbaseMaturity {
-			return 0, fmt.Errorf("input %d: coinbase not yet mature", i)
+			return 0, 0, fmt.Errorf("input %d: coinbase not yet mature", i)
 		}
-		inSum += u.Value
+		if inSum, err = addChecked(inSum, u.Value); err != nil {
+			return 0, 0, fmt.Errorf("input %d: %w", i, err)
+		}
 	}
 	for i := range t.Outputs {
 		if t.Outputs[i].Value > MaxSupply {
-			return 0, fmt.Errorf("output %d: value out of range", i)
+			return 0, 0, fmt.Errorf("output %d: value out of range", i)
 		}
-		outSum += t.Outputs[i].Value
+		if outSum, err = addChecked(outSum, t.Outputs[i].Value); err != nil {
+			return 0, 0, fmt.Errorf("output %d: %w", i, err)
+		}
 	}
 	if outSum > inSum {
-		return 0, fmt.Errorf("outputs (%s) exceed inputs (%s)", FormatAmount(outSum), FormatAmount(inSum))
+		return 0, 0, fmt.Errorf("outputs (%s) exceed inputs (%s)", FormatAmount(outSum), FormatAmount(inSum))
 	}
 	if err := t.VerifySignatures(func(op OutPoint) ([32]byte, bool) {
 		raw := utxos.Get(utxoKey(op))
@@ -449,9 +456,9 @@ func checkTx(dbtx *bolt.Tx, t *Tx, height uint64, spent map[OutPoint]bool) (uint
 		}
 		return u.Addr, true
 	}, height); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return inSum - outSum, nil
+	return inSum - outSum, inSum, nil
 }
 
 // checkHeaderContextual runs every validation that does not need UTXO state:
@@ -560,19 +567,25 @@ func connectTip(dbtx *bolt.Tx, b *Block, bh [32]byte) error {
 	height := b.Header.Height
 
 	spent := map[OutPoint]bool{}
-	var burnAdd, poolAdd uint64
+	var ledger blockLedger
 	for i, t := range b.Txs[1:] {
-		fee, err := checkTx(dbtx, t, height, spent)
+		fee, inSum, err := checkTx(dbtx, t, height, spent)
 		if err != nil {
 			return fmt.Errorf("tx %d: %w", i+1, err)
 		}
 		for j := range t.Inputs {
 			spent[t.Inputs[j].Prev] = true
 		}
-		bn, pl := SplitFee(fee)
-		burnAdd += bn
-		poolAdd += pl
+		if err := ledger.addTx(t, inSum, fee); err != nil {
+			return fmt.Errorf("tx %d: money invariant violated: %w", i+1, err)
+		}
 	}
+	// The block as a whole must balance. If it does not, some individual
+	// check let something through, and the block is refused regardless.
+	if err := ledger.reconcile(); err != nil {
+		return fmt.Errorf("block %d: money invariant violated: %w", height, err)
+	}
+	burnAdd, poolAdd := ledger.burned, ledger.pooled
 	poolBal := getU64(meta, kPool)
 	payout := PoolPayout(poolBal + poolAdd)
 	subsidy := BlockSubsidy(height)
@@ -971,7 +984,7 @@ func (c *Chain) SubmitTx(t *Tx) error {
 			}
 		}
 		next := getU64(dbtx.Bucket(bMeta), kTipHeight) + 1
-		fee, err := checkTx(dbtx, t, next, nil)
+		fee, _, err := checkTx(dbtx, t, next, nil)
 		if err != nil {
 			return err
 		}
@@ -1109,7 +1122,7 @@ func (c *Chain) NextBlockTemplate(miner [32]byte) (*Block, error) {
 			if err != nil {
 				return nil // skip malformed
 			}
-			fee, err := checkTx(dbtx, t, height, spent)
+			fee, _, err := checkTx(dbtx, t, height, spent)
 			if err != nil {
 				return nil // skip currently-invalid
 			}
