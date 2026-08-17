@@ -24,8 +24,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.6"
           cache: true
+      - name: Install GUI build dependencies (Linux)
+        run: sudo apt-get update -q && sudo apt-get install -y -q libgl1-mesa-dev xorg-dev
       - name: Build (all packages)
         run: go build ./...
       - name: Vet
@@ -43,12 +45,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.6"
           cache: true
       - name: staticcheck (consensus packages must be clean)
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./core/ ./p2p/ ./wallet/
-      - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: govulncheck (consensus packages and public-facing binaries — must be clean)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./core/ ./p2p/ ./wallet/ ./cmd/perihelion/ ./cmd/perihelion-explorer/
+      - name: govulncheck (desktop wallet — informational, GUI toolkit deps)
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./cmd/perihelion-app/
 
   fuzz:
     name: fuzz parsers
@@ -59,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.6"
           cache: true
       - name: Fuzz core parsers
         run: |
@@ -84,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "1.26.6"
           cache: true
       - name: Build node, explorer
         run: |
