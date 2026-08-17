@@ -197,6 +197,14 @@ func (n *Node) Synced() bool {
 	if err != nil {
 		return false
 	}
+	// Never mine on a chain that has not yet reached the newest checkpoint.
+	// Below it, proof-of-work is assumed rather than verified, so a branch
+	// there is provisional; building on it would waste work at best and, if a
+	// peer fed us a fake branch, extend a chain that gets refused at the
+	// checkpoint. Once past it, the chain is anchored and mining is safe.
+	if cp := core.LastCheckpointHeight(); cp > 0 && height < cp {
+		return false
+	}
 	return height >= best
 }
 

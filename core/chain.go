@@ -490,10 +490,54 @@ func checkHeaderContextual(dbtx *bolt.Tx, b *Block, parent *BlockHeader) error {
 	if MerkleRoot(b.Txs) != hdr.MerkleRoot {
 		return fmt.Errorf("merkle root mismatch")
 	}
-	if !CheckPow(hdr) {
+	// A block at a checkpointed height must carry the checkpointed hash; a
+	// branch that disagrees with a checkpoint is one this software does not
+	// follow, exactly as it would not follow a different genesis.
+	if checkpointConflict(hdr.Height, hdr.Hash()) {
+		return fmt.Errorf("block at height %d conflicts with a checkpoint", hdr.Height)
+	}
+	// Proof-of-work is the expensive check — 64 MiB of memory work per block —
+	// and it is what makes joining slow. It may be assumed only for blocks that
+	// are provably part of the checkpointed history: at or below the newest
+	// checkpoint AND on a chain that actually reaches it. Being "below the
+	// checkpoint height" on some other branch earns nothing, because such a
+	// branch never gets to the checkpoint hash and is refused there anyway —
+	// so an attacker cannot use a cheap fake branch to skip work; they can only
+	// build one that is rejected the moment it should meet the checkpoint.
+	//
+	// The practical rule that follows: skip PoW below the checkpoint only when
+	// the parent is on our active chain (which by construction leads to the
+	// checkpoint once we are past it) or when we have not yet reached the
+	// checkpoint height on any branch. Otherwise verify in full.
+	if !powAssumedValid(dbtx, hdr) && !CheckPow(hdr) {
 		return fmt.Errorf("invalid proof of work")
 	}
 	return nil
+}
+
+// powAssumedValid decides whether a block's proof-of-work can be taken as
+// given because it lies inside checkpointed history. See the comment at the
+// call site for why the branch condition matters.
+func powAssumedValid(dbtx *bolt.Tx, hdr *BlockHeader) bool {
+	last := LastCheckpointHeight()
+	if last == 0 || hdr.Height > last {
+		return false
+	}
+	// If the active chain already extends past the checkpoint, only blocks
+	// whose parent is on the active chain are inside checkpointed history.
+	// A block whose parent sits on a side branch is not covered.
+	meta := dbtx.Bucket(bMeta)
+	tip := getU64(meta, kTipHeight)
+	if tip >= last {
+		onActive := bytes.Equal(dbtx.Bucket(bHeight).Get(be64(hdr.Height-1)), hdr.PrevHash[:])
+		return onActive
+	}
+	// Still syncing towards the checkpoint: every block below it is
+	// provisional until the checkpoint hash is met. If the branch turns out
+	// wrong it is refused at the checkpoint, so skipping PoW here is safe —
+	// the worst an attacker achieves is making a fresh node download a branch
+	// it then throws away.
+	return true
 }
 
 // connectTip applies a block whose parent is the current active tip: full
@@ -1202,6 +1246,71 @@ type Holder struct {
 	Spendable uint64
 	Immature  uint64
 	Outputs   int
+}
+
+// HistoryEntry is one incoming or outgoing payment for an address. Mining
+// rewards are excluded: they are visible in the balance and the block list,
+// and including thousands of them would bury the actual transactions.
+type HistoryEntry struct {
+	Height uint64
+	Time   int64
+	Sent   bool // true = this address paid, false = it was paid
+	Amount uint64
+	TxID   [32]byte
+}
+
+// AddressHistory returns the most recent transactions involving an address,
+// newest first, scanning back from the tip until it has `limit` of them. A
+// transaction is "sent" if one of its inputs is signed by this address, and
+// "received" if it has an output to this address; the amount is the net value
+// that left or arrived, so change returned to oneself is not counted.
+func (c *Chain) AddressHistory(addr [32]byte, limit int) ([]HistoryEntry, error) {
+	var out []HistoryEntry
+	err := c.db.View(func(dbtx *bolt.Tx) error {
+		tip := getU64(dbtx.Bucket(bMeta), kTipHeight)
+		heights := dbtx.Bucket(bHeight)
+		for h := tip; h >= 1 && len(out) < limit; h-- {
+			hash := heights.Get(be64(h))
+			if hash == nil {
+				continue
+			}
+			b, err := readBlock(dbtx, hash)
+			if err != nil {
+				return err
+			}
+			for _, t := range b.Txs {
+				if t.IsCoinbase() {
+					continue
+				}
+				sent := false
+				for i := range t.Inputs {
+					if AddrOfPubKey(t.Inputs[i].PubKey) == addr {
+						sent = true
+						break
+					}
+				}
+				var toAddr, toOthers uint64
+				for i := range t.Outputs {
+					if t.Outputs[i].Addr == addr {
+						toAddr += t.Outputs[i].Value
+					} else {
+						toOthers += t.Outputs[i].Value
+					}
+				}
+				switch {
+				case sent && toOthers > 0:
+					out = append(out, HistoryEntry{h, b.Header.Time, true, toOthers, t.ID()})
+				case !sent && toAddr > 0:
+					out = append(out, HistoryEntry{h, b.Header.Time, false, toAddr, t.ID()})
+				}
+				if len(out) >= limit {
+					break
+				}
+			}
+		}
+		return nil
+	})
+	return out, err
 }
 
 // TopHolders aggregates the unspent output set by address and returns the
