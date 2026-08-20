@@ -276,6 +276,7 @@ func New(chain *core.Chain, logf func(string, ...any)) *Node {
 		startedAt: time.Now(),
 		book:      newAddrBook(),
 		dialing:   map[string]bool{},
+		banned:    map[string]time.Time{},
 	}
 }
 

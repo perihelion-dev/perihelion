@@ -54,18 +54,26 @@ const (
 // original and the chain-bound digest are accepted; from it, only the
 // chain-bound form is valid.
 //
-// Originally scheduled for block 60,000. Brought forward to 15,000 on
-// 2026-08-17 (roughly 36 hours' notice from height 12,825) because the
-// original margin bought nothing: the chain has carried fourteen transactions
-// in total, all long confirmed, so there is no pending old-format signature
-// to invalidate — and every day the switch waits is a day a fork sharing this
-// history could replay a payment. Wallets have signed chain-bound since the
-// change was introduced. Nodes on the network at the time of this change
-// already accept the chain-bound form, so no upgrade is needed to keep
-// following the chain; only a node that refuses to update its consensus rules
-// would diverge, and only if a legacy-signed transaction were mined after the
-// switch, which no current wallet produces.
-const SighashChainIDHeight uint64 = 15_000
+// This value is 60,000 — the originally scheduled height — and the history of
+// this constant is a lesson worth recording. On 2026-08-17 it was moved
+// forward to 15,000 with roughly 36 hours' notice, on the reasoning that the
+// chain carried almost no transactions and the replay window should close
+// sooner. The reasoning about replay was sound; the deployment was not. Most
+// miners were running binaries with the 60,000 rule and did not update within
+// 36 hours. At 07:32 UTC on 2026-08-18 a block containing a legacy-signed
+// transaction — valid under the deployed rules — split the network: the
+// majority of hashrate continued under 60,000 while updated nodes rejected
+// their chain. The value was reverted the same day and the updated nodes
+// rejoined the majority.
+//
+// The lesson is the project's own founding rule, learned the hard way: a
+// consensus rule changes when the network adopts it, not when the author
+// publishes it. Any future tightening of this schedule must go through miner
+// signalling (see deployment.go) or ship with months of notice — never days.
+// Wallets have signed chain-bound since 2026-08-17, so the replay window is
+// closed in practice for every transaction those wallets produce; this
+// constant is the backstop that closes it in consensus.
+const SighashChainIDHeight uint64 = 60_000
 
 // GenesisMessage is committed to by the genesis block's merkle root. It fixes
 // the chain's identity: any chain built on a different message is a different

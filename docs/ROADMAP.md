@@ -37,10 +37,17 @@ is cheap to lose; eight months is not.
    mainnet node is mining in isolation. Today a private fork from the same
    genesis produces coins indistinguishable from real PER until they vanish
    on reconnection — that must be impossible to confuse.
-2. ✅ **Chain-ID mandatory at block 15,000** (from 60,000). With almost no
-   transactions and no market value, the deferred switchover buys nothing and
-   leaves a replay window open. Publish signature test vectors and an exact
-   serialisation spec.
+2. ⚠️ **Chain-ID switchover: attempted at 15,000, reverted to 60,000.** The
+   acceleration was pushed with ~36 hours' notice; most miners had not
+   updated, and at block ~15,000 (2026-08-18, 07:32 UTC) a legacy-signed
+   transaction split the network — majority hashrate on the old rule, updated
+   nodes on the new one. Reverted the same day; updated nodes rejoined the
+   majority chain. The lesson is this project's own founding rule: consensus
+   changes activate when the network adopts them (miner signalling), not when
+   the author publishes them. Wallets sign chain-bound since 2026-08-17, so
+   the replay window is closed in practice; the consensus backstop arrives at
+   60,000 as originally scheduled. Test vectors and serialisation spec are
+   published (docs/test-vectors.json).
 3. ✅ **Automatic money-supply invariants on every block.** `perihelion audit`
    run by hand is not enough. Enforce in validation: inputs = outputs + fees;
    coinbase ≤ permitted; no duplicate input; no integer overflow; supply ≤
